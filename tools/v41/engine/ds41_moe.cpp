@@ -10,6 +10,7 @@
 // initialise the driver - accidental or otherwise.  Compiled with `DS4_MOE_CUDA` it is the full three-tier
 // implementation.  `tools/ds4/cmake/ds4_moe.cmake` builds both.
 #include "ds41_moe.hpp"
+#include "ds41_gpu2.hpp"
 #include "ds41_transcode.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
@@ -30,9 +31,7 @@
 #include <thread>
 #include <utility>
 
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/stat.h>
+#include "ds41_io.hpp"
 
 #include "strata/artifact/ds4_geometry.hpp"
 #include "ds41_geometry.hpp"
@@ -70,6 +69,9 @@ constexpr int kBatch = 512;    ///< a `ds4routes.bin` ubatch, in tokens (what ro
 }
 
 [[maybe_unused]] int64_t mem_available_gib() {
+#if defined(_WIN32)
+    return dio::mem_available_gib();
+#else
     std::FILE* f = std::fopen("/proc/meminfo", "r");
     if (!f) return -1;
     char line[256];
@@ -78,6 +80,7 @@ constexpr int kBatch = 512;    ///< a `ds4routes.bin` ubatch, in tokens (what ro
         if (std::sscanf(line, "MemAvailable: %ld kB", &kb) == 1) break;
     std::fclose(f);
     return kb < 0 ? -1 : (int64_t) (kb / (1024 * 1024));
+#endif
 }
 
 /// One metadata integer.  The `deepseek4.*` geometry keys are one-element arrays in the converter's output, but a
@@ -564,6 +567,14 @@ struct Ds41MoeImpl {
 #endif
     std::unique_ptr<Rebal> rebal;         ///< STRATA_ARENA_REBAL (null = off)
     std::vector<std::array<int32_t, 3>> shrunk;   ///< shrink_cache_for: (slot, layer, expert) evicted, for regrow_cache
+    /// --gpu2 (set_remote): the second card's experts.  Its result rows are read by the add kernel straight out of the
+    /// shared memory (registered + mapped once: r_out_dev); r_rows is the device copy of the rows they belong to.
+    Ds41Gpu2* remote = nullptr;
+    void* r_out_dev = nullptr;
+    int32_t* r_rows = nullptr;
+    int64_t r_rows_cap = 0;
+    std::vector<int32_t> r_lids, r_row;   ///< one call's local ids (worker experts -> -1) and the rows sent
+    std::vector<float> r_lw;
 };
 
 void rebal_count(Ds41MoeImpl& im, int64_t layer, const int32_t* ids, int64_t n);   // defined with rebalance_*
@@ -734,7 +745,7 @@ void chunk_stage_run(Ds41MoeImpl& im, int s) {
         for (int k = 0; k < nth; ++k)
             rd.emplace_back([&, k] {
                 void* q = nullptr;
-                uint8_t* scratch = posix_memalign(&q, 4096, sc) == 0 ? (uint8_t*) q : nullptr;
+                uint8_t* scratch = (uint8_t*) (q = dio::aligned_alloc(4096, sc));
                 for (int64_t i; (i = next.fetch_add(1)) < n;) {
                     if (c.cancel[s].load(std::memory_order_relaxed)) break;
                     uint8_t* dst = c.slab[s] + c.off[s][(size_t) i];
@@ -743,7 +754,7 @@ void chunk_stage_run(Ds41MoeImpl& im, int s) {
                     got.fetch_add((int64_t) c.len[s][(size_t) i], std::memory_order_relaxed);
                     c.done[s].fetch_add(1, std::memory_order_release);
                 }
-                std::free(scratch);
+                dio::aligned_free(scratch);
             });
         for (auto& t : rd) t.join();
         c.bytes[s] = got.load();
@@ -1079,8 +1090,8 @@ struct Ds41GgufBlobs::Impl {
     std::vector<int> dfds;
     std::vector<int> dfd[3];
     ~Impl() {
-        for (int f : fds) if (f >= 0) ::close(f);
-        for (int f : dfds) if (f >= 0) ::close(f);
+        for (int f : fds) if (f >= 0) dio::close(f);
+        for (int f : dfds) if (f >= 0) dio::close(f);
     }
 };
 
@@ -1123,14 +1134,14 @@ bool Ds41GgufBlobs::open(std::string& err) {
                 if (!std::getenv("STRATA_BLOB_MMAP")) {
                     if (im_->fds.size() < im_->model->size()) im_->fds.assign(im_->model->size(), -1);
                     int& fdv = im_->fds[at];
-                    if (fdv < 0) fdv = ::open(im_->model->shard(at).path().c_str(), O_RDONLY | O_CLOEXEC);
+                    if (fdv < 0) fdv = dio::open(im_->model->shard(at).path().c_str(), O_RDONLY | O_CLOEXEC);
                     if (im_->fd[r].empty()) { im_->fd[r].assign((size_t) g_.n_layers, -1); im_->foff[r].assign((size_t) g_.n_layers, 0); }
                     im_->fd[r][(size_t) l] = fdv;
                     const char* dv = std::getenv("STRATA_BLOB_DIRECT");
                     if (!(dv && dv[0] == '0')) {
                         if (im_->dfds.size() < im_->model->size()) im_->dfds.assign(im_->model->size(), -2);
                         int& dfv = im_->dfds[at];
-                        if (dfv == -2) dfv = ::open(im_->model->shard(at).path().c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+                        if (dfv == -2) dfv = dio::open(im_->model->shard(at).path().c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
                         if (im_->dfd[r].empty()) im_->dfd[r].assign((size_t) g_.n_layers, -1);
                         im_->dfd[r][(size_t) l] = dfv;
                     }
@@ -1161,19 +1172,19 @@ void Ds41GgufBlobs::read_span(int r, int64_t layer, int64_t expert, size_t lo, s
     if (dfv >= 0) {   // O_DIRECT: the aligned span around the range, then the range out of it
         constexpr uint64_t A = 4096;
         const uint64_t a0 = off & ~(A - 1), a1 = (off + n + A - 1) & ~(A - 1);
-        struct Bounce { uint8_t* p = nullptr; size_t n = 0; ~Bounce() { std::free(p); } };
+        struct Bounce { uint8_t* p = nullptr; size_t n = 0; ~Bounce() { dio::aligned_free(p); } };
         thread_local Bounce bb;
         if (bb.n < a1 - a0) {
-            std::free(bb.p);
+            dio::aligned_free(bb.p);
             bb.p = nullptr;
             bb.n = 0;
             void* q = nullptr;
-            if (posix_memalign(&q, A, (size_t) (a1 - a0)) == 0) { bb.p = (uint8_t*) q; bb.n = (size_t) (a1 - a0); }
+            if ((q = dio::aligned_alloc(A, (size_t) (a1 - a0))) != nullptr) { bb.p = (uint8_t*) q; bb.n = (size_t) (a1 - a0); }
         }
         if (bb.p) {
             size_t got = 0;
             while (got < a1 - a0) {
-                const ssize_t k = ::pread(dfv, bb.p + got, (size_t) (a1 - a0 - got), (off_t) (a0 + got));
+                const ssize_t k = dio::pread(dfv, bb.p + got, (size_t) (a1 - a0 - got), (int64_t) (a0 + got));
                 if (k <= 0) break;
                 got += (size_t) k;
             }
@@ -1186,7 +1197,7 @@ void Ds41GgufBlobs::read_span(int r, int64_t layer, int64_t expert, size_t lo, s
     if (fdv >= 0) {   // pread the range; fall back to the mmap on any short read / error
         size_t got = 0;
         while (got < n) {
-            const ssize_t k = ::pread(fdv, dst + got, n - got, (off_t) (off + got));
+            const ssize_t k = dio::pread(fdv, dst + got, n - got, (int64_t) (off + got));
             if (k <= 0) break;
             got += (size_t) k;
         }
@@ -1485,7 +1496,22 @@ bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ra
         return false;
     }
     if (im_->cfg.pin) {
-        gp.arena.owner.reset(new strata::core::PinnedArena(gp.arena.bytes));
+        // Fallback pieces for the CUDA registration: PinnedArena registers the whole arena first and uses these only
+        // when that is refused.  Measured (Windows 11, RTX 5090, driver 610.88, 159 GB RAM): one cudaHostRegister
+        // of 63 GiB is taken and 63.9 GiB is refused (out of memory), while 100 GiB in 4 GiB pieces registers and
+        // DMAs at 28.8 GB/s.  A copy that crosses two registrations fails (invalid argument), so every piece starts
+        // at an expert slot (each DMA moves one expert from inside its slot), page-aligned, ~4 GiB apart.
+        std::vector<uint64_t> bounds;
+        if (gp.arena.bytes > (4ull << 30)) {
+            bounds.push_back(0);
+            for (size_t i = 1; i + 1 < gp.arena.off.size(); ++i) {
+                const uint64_t o = gp.arena.off[i];
+                if (o % 4096 == 0 && o - bounds.back() >= (4ull << 30)) bounds.push_back(o);
+            }
+            bounds.push_back((gp.arena.bytes + 4095) / 4096 * 4096);
+            if (bounds.size() < 3) bounds.clear();
+        }
+        gp.arena.owner.reset(new strata::core::PinnedArena(gp.arena.bytes, bounds));
         if (!gp.arena.owner->valid()) {
             err = "pinned arena allocation of " + std::to_string(gib) + " GiB failed";
             gp.arena.close();
@@ -1497,7 +1523,7 @@ bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ra
         std::fprintf(stderr, "arena: %s\n", gp.arena.backing.c_str());
     } else {
         void* p = nullptr;
-        if (posix_memalign(&p, 4096, gp.arena.bytes) != 0 || !p) {
+        if (!(p = dio::aligned_alloc(4096, gp.arena.bytes))) {
             err = "anonymous arena allocation failed";
             gp.arena.close();
             return false;
@@ -3070,7 +3096,9 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     // ---- distinct experts, first-seen order (entries keep their routing index j = t*K + k) ----
     int32_t ue[kMaxEnt], ent_u[kMaxEnt];
     int nu = 0;
+    bool masked = false;   // --gpu2: an id of -1 is no expert (the second card's): no group, a zero row, weight 0
     for (int j = 0; j < NE; ++j) {
+        if (ids[j] < 0) { ent_u[j] = -1; masked = true; continue; }
         int u = -1;
         for (int i = 0; i < nu && u < 0; ++i)
             if (ue[i] == ids[j]) u = i;
@@ -3450,6 +3478,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         // routing-index rows of d_parts, the pass's weights through the metadata block, and decode_rows_sum
         // adds one token's K rows in double - the host loop, bit for bit. ----
         for (int j = 0; j < NE; ++j) {
+            if (ent_u[j] < 0) continue;
             if (w[j] == 0.0f) continue;
             if (cls[ent_u[j]] != CPU) continue;
             float* hrow = (float*) gp.h_parts + (size_t) j * (size_t) H;
@@ -3457,6 +3486,8 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             ck(cudaMemcpyAsync((float*) gp.d_parts + (size_t) j * (size_t) H, hrow, (size_t) H * 4, cudaMemcpyHostToDevice,
                                gp.s), "cpu row h2d");
         }
+        for (int j = 0; masked && j < NE; ++j)   // no kernel wrote a masked entry's row
+            if (ent_u[j] < 0) ck(cudaMemsetAsync((float*) gp.d_parts + (size_t) j * (size_t) H, 0, (size_t) H * 4, gp.s), "masked row");
         const size_t o_w = 0;   // [0, kMetaW): the pass's weights (NE <= kMaxEnt floats); the launches' metadata sits above
         static_assert(sizeof(float) * kMaxEnt <= 1024, "the weights must fit below kMetaW");
         std::memcpy(gp.h_meta + o_w, w, sizeof(float) * (size_t) NE);
@@ -3476,6 +3507,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                 double acc = 0;
                 for (int64_t k = 0; k < K; ++k) {
                     const int j = t * (int) K + (int) k;
+                    if (ent_u[j] < 0) continue;
                     const float* p = cls[ent_u[j]] == CPU ? im.parts_n.data() + (size_t) j * H : gpu_parts + (size_t) j * H;
                     acc += (double) w[j] * (double) p[(size_t) i];
                 }
@@ -3538,6 +3570,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     for (int b = 0; b < nfg; ++b)
         if (fg_vic[b] >= 0) arena_check_swap(im, layer, ue[fg_u[b]], fg_slot[b]);
     for (int j = 0; j < NE; ++j) {
+        if (ent_u[j] < 0) continue;
         const int c = cls[ent_u[j]];
         if (c == HIT) ++st.hits; else if (c == PCIE || c == FILEG) ++st.pcie; else ++st.cpu;
     }
@@ -3778,7 +3811,8 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     const int64_t CI = cf >= 0 ? cf : layer;          // the format class this pass computes
     const int64_t BL = im.bl[(size_t) CI];
     const strata::kernels::NativeExpertLayout& GL = gp.gll[(size_t) CI];
-    auto in_pass = [&](int64_t j) { return cf < 0 || im.g.cls(layer, ids[j]) == cf; };
+    // --gpu2: an id of -1 is no expert (the second card's): in no pass, its parts row zero, its weight 0
+    auto in_pass = [&](int64_t j) { return ids[j] >= 0 && (cf < 0 || im.g.cls(layer, ids[j]) == cf); };
     const double t0 = now_ms();
     Ds41MoeStats st;
 
@@ -3892,8 +3926,10 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     const int64_t NX = im.g.n_experts;
     std::vector<int32_t> cnt((size_t) NX, 0);
     int64_t NEP = 0;   // entries of this pass
+    bool masked = false;
     for (int64_t j = 0; j < NE; ++j) {
-        if (ids[j] < 0 || ids[j] >= NX) return false;
+        if (ids[j] >= NX) return false;
+        if (ids[j] < 0) { masked = true; continue; }
         if (!in_pass(j)) continue;
         ++cnt[(size_t) ids[j]];
         ++NEP;
@@ -3940,6 +3976,8 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     ck(cudaMemcpyAsync(gp.c_tokv, tok.data(), sizeof(int32_t) * (size_t) NEP, cudaMemcpyHostToDevice, gp.s), "c_tok");
 
     // ---- activations (the first class pass only) ----
+    if (first_pass && masked)   // the masked entries' rows: no kernel writes them, the weighted sum reads them
+        ck(cudaMemsetAsync(gp.c_parts, 0, (size_t) NE * (size_t) H * 4, gp.s), "c_parts zero");
     if (first_pass) ck(cudaMemcpyAsync(gp.c_x, x_host, (size_t) n * (size_t) H * 4, cudaMemcpyHostToDevice, gp.s), "c_x h2d");
     if (first_pass) {   // the MMVQ quantizer takes <= 8 columns per call; columns are contiguous per token, so step through them
         const size_t col = strata::kernels::native_q8_1_bytes((int) H, 1);
@@ -4033,7 +4071,8 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
                 gp.m_tc_cap = 0;
                 size_t fr = 0, tot = 0;
                 cudaMemGetInfo(&fr, &tot);
-                const size_t keep = (size_t) 2 << 30;   // room for the dense pass buffer (grows with the prompt)
+                // room for the dense pass buffer (grows with the prompt); STRATA_MMQ_TC_KEEP_GIB (the --gpu2 worker has none)
+                static const size_t keep = (size_t) ((std::getenv("STRATA_MMQ_TC_KEEP_GIB") ? std::atof(std::getenv("STRATA_MMQ_TC_KEEP_GIB")) : 2.0) * 1073741824.0);
                 // at most STRATA_MMQ_TC_GIB (1): taking all the free VRAM squeezed the next-layer prestage region
                 // (3.00 -> 1.37 GiB) and cost the dense half ~1.2 s on an 8K prompt; 1 GiB = ~80 transcoded experts
                 // per MMQ launch
@@ -4106,12 +4145,39 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     std::vector<int32_t> run_e;
     std::vector<unsigned long long> run_p;
     int64_t ent_hit = 0, ent_str = 0;
-    for (int32_t e : order[0]) {
-        run_e.push_back(e);
-        run_p.push_back((unsigned long long) gp.cache->device_slot(slot_e[(size_t) e]));
-        ent_hit += cnt[(size_t) e];
+#if defined(DS4_MOE_MMQ)
+    if (use_mmq && im.cfg.chunk_resident_mmq && !order[0].empty()) {
+        // chunk_resident_mmq (the --gpu2 worker, whose experts are all resident): MMQ needs a run's blobs SL apart, the
+        // cache slots are BL apart (-> the MMVQ kernel, ~10x slower at prompt widths).  Copy them device-to-device into
+        // the stage halves, SL apart, a half at a time; all on gp.s, so a copy waits for the kernels that read the half.
+        const int64_t per_half_r = std::max<int64_t>(1, gp.c_half / SL);
+        int hh = 0;
+        for (size_t b0 = 0; b0 < order[0].size(); b0 += (size_t) per_half_r, hh ^= 1) {
+            const size_t b1 = std::min(order[0].size(), b0 + (size_t) per_half_r);
+            run_e.clear();
+            run_p.clear();
+            for (size_t i = b0; i < b1; ++i) {
+                const int32_t e = order[0][i];
+                uint8_t* d = (uint8_t*) gp.c_stage[hh] + (i - b0) * (size_t) SL;
+                ck(cudaMemcpyAsync(d, gp.cache->device_slot(slot_e[(size_t) e]), (size_t) BL, cudaMemcpyDeviceToDevice, gp.s),
+                   "resident stage");
+                run_e.push_back(e);
+                run_p.push_back((unsigned long long) d);
+                ent_hit += cnt[(size_t) e];
+            }
+            launch(run_e, run_p);
+            ck(cudaEventRecord(gp.c_used[hh], gp.s), "used");   // the streaming below reuses the halves after these
+        }
+    } else
+#endif
+    {
+        for (int32_t e : order[0]) {
+            run_e.push_back(e);
+            run_p.push_back((unsigned long long) gp.cache->device_slot(slot_e[(size_t) e]));
+            ent_hit += cnt[(size_t) e];
+        }
+        launch(run_e, run_p);
     }
-    launch(run_e, run_p);
     in_resident = false;
 
     // ---- streamed experts: arena ones, then the file tier, in batches that fit one device half.  File-tier blobs
@@ -4130,7 +4196,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         int nr = 0;
         for (int64_t j = 0; j < NE; ++j) {
             const int32_t e = ids[j];
-            if (routed[(size_t) e] || !gp.arena.ptr(layer, e)) continue;
+            if (e < 0 || routed[(size_t) e] || !gp.arena.ptr(layer, e)) continue;
             if (gp.cache && !im.cfg.no_cache && gp.cache->slot_of(layer, e) >= 0) continue;
             routed[(size_t) e] = 1;
             ++nr;
@@ -4389,6 +4455,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
             });
         for (auto& t : th) t.join();
         for (int64_t j = 0; j < NE; ++j) {
+            if (ids[j] < 0) continue;
             const size_t at = (size_t) (layer * NX + ids[j]);
             im.sal_sum[at] += (double) w[j] * nrm[(size_t) j];
             ++im.sal_cnt[at];
@@ -4465,10 +4532,21 @@ bool chunk_classes(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     const int64_t NE = (int64_t) n * im.g.top_k;
     std::vector<int> cl;
     for (int64_t j = 0; j < NE; ++j) {
+        if (ids[j] < 0) continue;   // --gpu2: the second card's
         const int c = im.g.cls(layer, ids[j]);
         if (std::find(cl.begin(), cl.end(), c) == cl.end()) cl.push_back(c);
     }
     std::sort(cl.begin(), cl.end());
+    if (cl.empty()) {   // every entry is the second card's: this card's sum is zero
+        const size_t bytes = (size_t) n * (size_t) im.g.n_embd * 4;
+        if (out_dev) {
+            ck(cudaMemsetAsync(out_dev, 0, bytes, im.gpu->s), "chunk zero");
+            ck(cudaStreamSynchronize(im.gpu->s), "chunk zero sync");
+        } else {
+            std::memset(out, 0, bytes);
+        }
+        return true;
+    }
     for (size_t i = 0; i < cl.size(); ++i)
         if (!gpu_run_chunk(im, layer, n, ids, w, x, out, out_dev, cl[i], i == 0, i + 1 == cl.size())) return false;
     chunk_pstage_next(im, layer, n);
@@ -4476,9 +4554,144 @@ bool chunk_classes(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
 }
 #endif
 
+// ---- --gpu2 (ds41_gpu2.hpp): one call split between this card and the second one ----
+
+#if defined(DS4_MOE_CUDA)
+/// Puts the rows that route to one of the second card's experts into the shared memory (their ids / weights, -1 / 0
+/// for the rest, and their activations) and starts the worker on them; im.r_lids / r_lw get the call's ids / weights
+/// with the second card's entries as -1 / 0 (this card's share).  False = nothing of this call is the second card's
+/// (or it is down, or the call is wider than its buffers): the caller runs the one-card path with its own ids.
+bool remote_submit(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, const float* w, const float* x, bool chunk) {
+    Ds41Gpu2* r = im.remote;
+    if (!r || !r->ok()) return false;
+    const int64_t K = im.g.top_k, H = im.g.n_embd;
+    im.r_row.clear();
+    int64_t nent = 0;
+    for (int t = 0; t < n; ++t) {
+        bool any = false;
+        for (int64_t k = 0; k < K; ++k) {
+            const int32_t e = ids[(size_t) (t * K + k)];
+            if (e >= 0 && r->owns(layer, e)) { any = true; ++nent; }
+        }
+        if (any) im.r_row.push_back(t);
+    }
+    if (im.r_row.empty() || (int) im.r_row.size() > r->max_rows()) return false;
+    const int nr = (int) im.r_row.size();
+    im.r_lids.assign(ids, ids + (size_t) n * (size_t) K);
+    im.r_lw.assign(w, w + (size_t) n * (size_t) K);
+    int32_t* rid = r->ids();
+    float* rw = r->w();
+    for (int q = 0; q < nr; ++q) {
+        const int64_t t = im.r_row[(size_t) q];
+        for (int64_t k = 0; k < K; ++k) {
+            const size_t j = (size_t) (t * K + k);
+            const bool own = ids[j] >= 0 && r->owns(layer, ids[j]);
+            rid[(size_t) (q * K + k)] = own ? ids[j] : -1;
+            rw[(size_t) (q * K + k)] = own ? w[j] : 0.0f;
+            if (own) { im.r_lids[j] = -1; im.r_lw[j] = 0.0f; }
+        }
+    }
+    // the activations: a prompt batch's rows are ~200 MB, copied by 8 threads (one ~20 ms memcpy otherwise)
+    float* rx = r->x();
+    auto copy_rows = [&](int q0, int q1) {
+        for (int q = q0; q < q1; ++q)
+            std::memcpy(rx + (size_t) q * (size_t) H, x + (size_t) im.r_row[(size_t) q] * (size_t) H, (size_t) H * 4);
+    };
+    if ((int64_t) nr * H * 4 >= (16LL << 20)) {
+        std::thread th[8];
+        for (int i = 0; i < 8; ++i) th[i] = std::thread(copy_rows, nr * i / 8, nr * (i + 1) / 8);
+        for (auto& t : th) t.join();
+    } else {
+        copy_rows(0, nr);
+    }
+    r->entries += nent;
+    im.st.remote += nent;
+    return r->submit(chunk ? Ds41Gpu2::kChunk : Ds41Gpu2::kMulti, layer, nr);
+}
+
+/// Waits for the worker and adds its sums into the call's rows (out_dev on this card, or out_host).  Neither given:
+/// only waits.  False = the worker failed this call (it is marked down; the caller recomputes the call itself).
+bool remote_finish(Ds41MoeImpl& im, float* out_host, void* out_dev) {
+    std::string err;
+    if (!im.remote->wait(err)) return false;
+    const int nr = (int) im.r_row.size();
+    const int64_t H = im.g.n_embd;
+    const float* ro = im.remote->out();
+    if (out_dev) {
+        Gpu& gp = *im.gpu;
+        if (nr > im.r_rows_cap) {
+            if (im.r_rows) cudaFree(im.r_rows);
+            im.r_rows = nullptr;
+            im.r_rows_cap = 0;
+            ck(cudaMalloc((void**) &im.r_rows, sizeof(int32_t) * (size_t) nr), "gpu2 rows");
+            im.r_rows_cap = nr;
+        }
+        ck(cudaMemcpyAsync(im.r_rows, im.r_row.data(), sizeof(int32_t) * (size_t) nr, cudaMemcpyHostToDevice, gp.s), "gpu2 rows h2d");
+        // the kernel reads the worker's rows straight out of the shared memory (registered + mapped in set_remote)
+        ds41_add_rows_f32((float*) out_dev, im.r_rows, (const float*) im.r_out_dev, nr, H, gp.s);
+        ck(cudaStreamSynchronize(gp.s), "gpu2 add");
+    } else if (out_host) {
+        for (int q = 0; q < nr; ++q) {
+            float* d = out_host + (size_t) im.r_row[(size_t) q] * (size_t) H;
+            const float* s = ro + (size_t) q * (size_t) H;
+            for (int64_t i = 0; i < H; ++i) d[i] += s[i];
+        }
+    }
+    return true;
+}
+#endif
+
+/// Runs `local(ids, w)` - one public run* call's own path - with the second card's experts split off when --gpu2 is
+/// on: the worker computes those rows while `local` computes the rest, then its sums are added.  Off (or nothing of
+/// the call is the second card's): `local` with the caller's ids, exactly the one-card path.
+template <class F>
+bool with_remote(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, const float* w, const float* x, bool chunk,
+                 float* out_host, void* out_dev, F&& local) {
+#if defined(DS4_MOE_CUDA)
+    if (im.remote && !im.cfg.cpu_only && im.gpu && remote_submit(im, layer, n, ids, w, x, chunk)) {
+        std::vector<int32_t> lids;
+        std::vector<float> lw;
+        lids.swap(im.r_lids);
+        lw.swap(im.r_lw);
+        const bool ok = local(lids.data(), lw.data());
+        const bool rok = remote_finish(im, ok ? out_host : nullptr, ok ? out_dev : nullptr);
+        lids.swap(im.r_lids);   // keep the capacity for the next call
+        lw.swap(im.r_lw);
+        if (!ok) return false;
+        if (rok) return true;
+        // the second card failed this call (and is off from now on): this card computes its experts too
+    }
+#else
+    (void) layer; (void) n; (void) x; (void) chunk; (void) out_host; (void) out_dev;
+#endif
+    return local(ids, w);
+}
+
+bool Ds41MoeTier::set_remote(Ds41Gpu2* r, std::string& err) {
+#if defined(DS4_MOE_CUDA)
+    if (!r) { im_->remote = nullptr; return true; }
+    if (!im_->inited || !im_->gpu || im_->cfg.cpu_only) { err = "--gpu2 needs the GPU tier"; return false; }
+    if (r->config().n_embd != im_->g.n_embd || r->config().top_k != im_->g.top_k) { err = "--gpu2: geometry mismatch"; return false; }
+    // the worker's result rows, read by the add kernel in place (mapped): ~200 MB for a 12K prompt batch
+    if (cudaHostRegister(r->out(), r->out_bytes(), cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess ||
+        cudaHostGetDevicePointer(&im_->r_out_dev, r->out(), 0) != cudaSuccess) {
+        cudaGetLastError();
+        err = "--gpu2: cannot map the shared result rows for the card";
+        return false;
+    }
+    im_->remote = r;
+    return true;
+#else
+    (void) r;
+    err = "--gpu2 needs the CUDA tier";
+    return false;
+#endif
+}
+
 bool Ds41MoeTier::run(int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out) {
     if (!im_->inited || !im_->pool) return false;
     if (!ids6 || !w6 || !x || !out) return false;
+    if (im_->remote && im_->remote->ok()) return run_multi(layer, 1, ids6, w6, x, out);   // --gpu2: the split path
     rebal_count(*im_, layer, ids6, im_->g.top_k);
     if (!im_->g.routed(layer)) return false;
     if (im_->cfg.cpu_only) return cpu_run(*im_, layer, ids6, w6, x, out);
@@ -4492,6 +4705,11 @@ bool Ds41MoeTier::run(int64_t layer, const int32_t* ids6, const float* w6, const
 bool Ds41MoeTier::run_to_dev(int64_t layer, const int32_t* ids6, const float* w6, const float* x, void* out_dev) {
     if (!im_->inited || !im_->pool) return false;
     if (!ids6 || !w6 || !x || !out_dev) return false;
+    if (im_->remote && im_->remote->ok()) {   // --gpu2: a token that routes to the second card goes the split path
+        bool any = false;
+        for (int64_t k = 0; k < im_->g.top_k && !any; ++k) any = ids6[k] >= 0 && im_->remote->owns(layer, ids6[k]);
+        if (any) return run_multi_to_dev(layer, 1, ids6, w6, x, out_dev);
+    }
     rebal_count(*im_, layer, ids6, im_->g.top_k);
     if (!im_->g.routed(layer) || im_->cfg.cpu_only) return false;
 #if defined(DS4_MOE_CUDA)
@@ -4501,9 +4719,10 @@ bool Ds41MoeTier::run_to_dev(int64_t layer, const int32_t* ids6, const float* w6
 #endif
 }
 
-bool Ds41MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out) {
+bool Ds41MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids_in, const float* w_in, const float* x, float* out) {
     if (!im_->inited || !im_->pool) return false;
-    if (!ids || !w || !x || !out || nt < 1 || nt > kMaxTok) return false;
+    if (!ids_in || !w_in || !x || !out || nt < 1 || nt > kMaxTok) return false;
+    return with_remote(*im_, layer, nt, ids_in, w_in, x, false, out, nullptr, [&](const int32_t* ids, const float* w) -> bool {
     rebal_count(*im_, layer, ids, (int64_t) nt * im_->g.top_k);
     if (!im_->g.routed(layer)) return false;
     if (im_->cfg.cpu_only) {   // the CPU tier: token by token (no sharing; it is not the verify path)
@@ -4524,6 +4743,7 @@ bool Ds41MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids, const flo
 #else
     return false;
 #endif
+    });
 }
 
 void Ds41MoeTier::profiler(bool on) {
@@ -4534,9 +4754,10 @@ void Ds41MoeTier::profiler(bool on) {
 #endif
 }
 
-bool Ds41MoeTier::run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, void* out_dev) {
+bool Ds41MoeTier::run_multi_to_dev(int64_t layer, int nt, const int32_t* ids_in, const float* w_in, const float* x, void* out_dev) {
     if (!im_->inited || !im_->pool) return false;
-    if (!ids || !w || !x || !out_dev || nt < 1 || nt > kMaxTok) return false;
+    if (!ids_in || !w_in || !x || !out_dev || nt < 1 || nt > kMaxTok) return false;
+    return with_remote(*im_, layer, nt, ids_in, w_in, x, false, nullptr, out_dev, [&](const int32_t* ids, const float* w) -> bool {
     rebal_count(*im_, layer, ids, (int64_t) nt * im_->g.top_k);
     if (!im_->g.routed(layer)) return false;
     if (std::getenv("DS41_DBG_X")) std::fprintf(stderr, "[dbg_x] ENTER run_multi_to_dev layer=%lld nt=%d\n", (long long) layer, nt);
@@ -4560,6 +4781,7 @@ bool Ds41MoeTier::run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, co
     (void) layer; (void) nt; (void) ids; (void) w; (void) x; (void) out_dev;
 #endif
     return false;
+    });
 }
 
 bool Ds41MoeTier::build_arena_from_routes(const std::string& routes_bin, int batch_tokens, std::string& err) {
@@ -4802,7 +5024,10 @@ bool Ds41MoeTier::run_chunk(int64_t layer, int n, const int32_t* ids, const floa
     if (!im_->inited || !ids || !w || !x || !out || n < 1) return false;
     if (!im_->g.routed(layer)) return false;
 #if defined(DS4_MOE_CUDA)
-    if (im_->gpu && !im_->cfg.cpu_only) return chunk_classes(*im_, layer, n, ids, w, x, out, nullptr);
+    if (im_->gpu && !im_->cfg.cpu_only)
+        return with_remote(*im_, layer, n, ids, w, x, true, out, nullptr, [&](const int32_t* li, const float* lw) {
+            return chunk_classes(*im_, layer, n, li, lw, x, out, nullptr);
+        });
 #endif
     // CPU tier: token by token
     const int64_t K = im_->g.top_k, H = im_->g.n_embd;
@@ -4815,7 +5040,10 @@ bool Ds41MoeTier::run_chunk_dev(int64_t layer, int n, const int32_t* ids, const 
     if (!im_->inited || !ids || !w || !x || !out_dev || n < 1) return false;
     if (!im_->g.routed(layer)) return false;
 #if defined(DS4_MOE_CUDA)
-    if (im_->gpu && !im_->cfg.cpu_only) return chunk_classes(*im_, layer, n, ids, w, x, nullptr, out_dev);
+    if (im_->gpu && !im_->cfg.cpu_only)
+        return with_remote(*im_, layer, n, ids, w, x, true, nullptr, out_dev, [&](const int32_t* li, const float* lw) {
+            return chunk_classes(*im_, layer, n, li, lw, x, nullptr, out_dev);
+        });
 #endif
     return false;
 }
@@ -5166,6 +5394,12 @@ void Ds41MoeTier::close() {
     if (!im_) return;
 #if defined(DS4_MOE_CUDA)
     chunk_stage_close(*im_);   // join the prefetch readers, free the pinned slabs
+    if (im_->r_rows) cudaFree(im_->r_rows);
+    im_->r_rows = nullptr;
+    im_->r_rows_cap = 0;
+    if (im_->remote) cudaHostUnregister(im_->remote->out());
+    im_->remote = nullptr;
+    im_->r_out_dev = nullptr;
 #endif
     if (im_->gpu) im_->gpu->close();
     im_->gpu.reset();
@@ -5252,6 +5486,7 @@ void Ds41MoeStats::add(const Ds41MoeStats& o) {
     vram_swaps += o.vram_swaps;
     vram_demotes += o.vram_demotes;
     skipped += o.skipped;
+    remote += o.remote;
     gap_ms += o.gap_ms;
     hit_ms += o.hit_ms;
     pcie_ms += o.pcie_ms;
@@ -5263,10 +5498,10 @@ void Ds41MoeStats::add(const Ds41MoeStats& o) {
 
 Ds41FileBlobs::Ds41FileBlobs(std::string gguf) : path_(std::move(gguf)) {}
 Ds41FileBlobs::~Ds41FileBlobs() {
-    if (fd_ >= 0) ::close(fd_);
-    if (dfd_ >= 0) ::close(dfd_);
-    if (mfd_ >= 0) ::close(mfd_);
-    for (uint8_t* p : ball_) std::free(p);
+    if (fd_ >= 0) dio::close(fd_);
+    if (dfd_ >= 0) dio::close(dfd_);
+    if (mfd_ >= 0) dio::close(mfd_);
+    for (uint8_t* p : ball_) dio::aligned_free(p);
 }
 
 uint8_t* Ds41FileBlobs::take_bounce() const {
@@ -5276,7 +5511,7 @@ uint8_t* Ds41FileBlobs::take_bounce() const {
         bfree_.pop_back();
         return p;
     }
-    uint8_t* p = (uint8_t*) std::aligned_alloc(4096, (scratch_ + 4095) & ~(size_t) 4095);
+    uint8_t* p = (uint8_t*) dio::aligned_alloc(4096, (scratch_ + 4095) & ~(size_t) 4095);
     if (p) ball_.push_back(p);
     return p;
 }
@@ -5287,7 +5522,7 @@ void Ds41FileBlobs::give_bounce(uint8_t* p) const {
 }
 
 bool Ds41FileBlobs::open(std::string& err) {
-    if (fd_ >= 0) return true;
+    if (opened_) return true;
     std::unique_ptr<GgufModel> m;
     try { m = std::make_unique<GgufModel>(GgufModel::open(path_)); }
     catch (const std::exception& e) { err = e.what(); return false; }
@@ -5348,13 +5583,32 @@ bool Ds41FileBlobs::open(std::string& err) {
     }
     for (size_t c = 0; c < g_.cls_gu.size(); ++c)
         max_ = std::max<size_t>(max_, (size_t) (2 * (uint64_t) gu_rb_[c] * (uint64_t) FF + (uint64_t) d_rb_[c] * (uint64_t) D));
-    fd_ = ::open(path_.c_str(), O_RDONLY);
+#if defined(_WIN32)
+    // Windows: drop GgufModel's mapping now (nothing below needs it) and open no buffered handle here - buffered_fd()
+    // opens one on first use, which the unbuffered paths never make.  While a mapping or a buffered handle of the file
+    // lives, NTFS checks cache coherency on every unbuffered read of it: the prompt's file tier ran at 3.8 GB/s against
+    // the drive's 7.0 (docs/WINDOWS_DS41.md).
+    m.reset();
+#else
+    fd_ = dio::open(path_.c_str(), O_RDONLY);
     if (fd_ < 0) { err = "cannot open " + path_; return false; }
-    ::posix_fadvise(fd_, 0, 0, POSIX_FADV_RANDOM);
+    dio::posix_fadvise(fd_, 0, 0, POSIX_FADV_RANDOM);
+#endif
     // The chunk-prefetch reader pool's O_DIRECT twin (measured 2.25 -> 4.65 GB/s on the scattered expert pattern).
     // STRATA_BLOB_DIRECT=0 keeps the buffered path; a filesystem that refuses O_DIRECT just leaves dfd_ = -1.
     const char* dv = std::getenv("STRATA_BLOB_DIRECT");
-    if (!(dv && dv[0] == '0')) dfd_ = ::open(path_.c_str(), O_RDONLY | O_DIRECT);
+    if (!(dv && dv[0] == '0')) dfd_ = dio::open(path_.c_str(), O_RDONLY | O_DIRECT);
+    // read_part straight into its destination where the piece is sector-aligned (Windows; dio::direct_align is 0 on
+    // Linux, which keeps the bounce): the bounce memcpy is a second pass over every file-tier byte in host RAM, and in
+    // the prompt that pass competes with the arena's DMA to the card.  ds41_rdbench (990 PRO 4TB, 32 threads x 8
+    // parts, 8 GiB pinned H2D copy alongside): bounce 4.76-5.07 GB/s read + 18.7-20.0 GB/s H2D, in place 6.89-7.04 +
+    // 27.4-28.1 (7.05 alone).  The engine, 8K prompt: file tier 6.64 -> 6.97 GB/s, prompt 23.83 -> 23.24 s.
+    // STRATA_READ_INPLACE=0 keeps the bounce.
+    const char* ip = std::getenv("STRATA_READ_INPLACE");
+    if (dfd_ >= 0 && !(ip && ip[0] == '0')) dalign_ = dio::direct_align(dfd_);
+#if defined(_WIN32)
+    if (dfd_ < 0 && buffered_fd() < 0) { err = "cannot open " + path_; return false; }   // no twin: buffered is the path
+#endif
     // decode misses (read_part) through it too: random 6.75 MB blobs 1.43 vs 1.99 ms cold (rdbench, SSD NVME), and no
     // page-cache churn inside the 84 GiB cgroup that also holds the pinned arena
     const char* pd = std::getenv("STRATA_DECODE_DIRECT");
@@ -5370,7 +5624,15 @@ bool Ds41FileBlobs::open(std::string& err) {
         std::string merr;
         if (!open_mirror(mp, merr)) std::fprintf(stderr, "blob mirror: NOT used (%s)\n", merr.c_str());
     }
+    opened_ = true;
     return true;
+}
+
+int Ds41FileBlobs::buffered_fd() const {
+#if defined(_WIN32)
+    std::call_once(fd_once_, [this] { fd_ = dio::open(path_.c_str(), O_RDONLY); });
+#endif
+    return fd_;
 }
 
 // The mirror file: a 4096-byte-aligned header, then the blobs, each [gate | up | down] padded to 4096.
@@ -5381,14 +5643,16 @@ struct MirrorEnt { int32_t l, e; uint64_t off; };
 }
 
 bool Ds41FileBlobs::open_mirror(const char* path, std::string& err) {
-    const int fd = ::open(path, O_RDONLY | O_DIRECT);
+    const int fd = dio::open(path, O_RDONLY | O_DIRECT);
     if (fd < 0) { err = std::string("cannot open ") + path + " O_DIRECT"; return false; }
-    auto fail = [&](const std::string& m) { ::close(fd); err = m; return false; };
-    struct stat st{}, ss{};
-    if (::fstat(fd, &st) != 0 || ::fstat(fd_, &ss) != 0) return fail("fstat");
-    uint8_t* h = (uint8_t*) std::aligned_alloc(4096, 4096);
-    std::unique_ptr<uint8_t, void (*)(void*)> hg(h, std::free);
-    if (::pread(fd, h, 4096, 0) != 4096) return fail("short header");
+    auto fail = [&](const std::string& m) { dio::close(fd); err = m; return false; };
+    dio::Stat st{}, ss{};
+    // the model file's size through the unbuffered twin: on Windows a buffered handle of the model file would make NTFS
+    // check cache coherency on every unbuffered read of it (7.0 -> 3.4 GB/s, "SSD reads on Windows")
+    if (dio::fstat(fd, &st) != 0 || dio::fstat(dfd_ >= 0 ? dfd_ : buffered_fd(), &ss) != 0) return fail("fstat");
+    uint8_t* h = (uint8_t*) dio::aligned_alloc(4096, 4096);
+    std::unique_ptr<uint8_t, void (*)(void*)> hg(h, dio::aligned_free);
+    if (dio::pread(fd, h, 4096, 0) != 4096) return fail("short header");
     MirrorHead H;
     std::memcpy(&H, h, sizeof H);
     if (std::memcmp(H.magic, "S41MIRR1", 8) != 0) return fail("bad magic");
@@ -5396,10 +5660,10 @@ bool Ds41FileBlobs::open_mirror(const char* path, std::string& err) {
     const uint64_t NE = (uint64_t) (g_.n_layers * g_.n_experts);
     if (H.n == 0 || H.n > NE || H.data < sizeof H + H.n * sizeof(MirrorEnt) || (H.data & 4095)) return fail("bad header");
     const size_t tb = (size_t) H.data;
-    uint8_t* t = (uint8_t*) std::aligned_alloc(4096, tb);
-    std::unique_ptr<uint8_t, void (*)(void*)> tg(t, std::free);
+    uint8_t* t = (uint8_t*) dio::aligned_alloc(4096, tb);
+    std::unique_ptr<uint8_t, void (*)(void*)> tg(t, dio::aligned_free);
     for (size_t got = 0; got < tb;) {
-        const ssize_t k = ::pread(fd, t + got, tb - got, (off_t) got);
+        const ssize_t k = dio::pread(fd, t + got, tb - got, (int64_t) got);
         if (k <= 0) return fail("short index");
         got += (size_t) k;
     }
@@ -5425,11 +5689,11 @@ bool Ds41FileBlobs::open_mirror(const char* path, std::string& err) {
         const size_t n = expert_bytes(x.l, x.e);
         read(x.l, x.e, a.data());
         const size_t span = (n + 4095) & ~(size_t) 4095;
-        uint8_t* m = (uint8_t*) std::aligned_alloc(4096, span);
-        std::unique_ptr<uint8_t, void (*)(void*)> mg(m, std::free);
+        uint8_t* m = (uint8_t*) dio::aligned_alloc(4096, span);
+        std::unique_ptr<uint8_t, void (*)(void*)> mg(m, dio::aligned_free);
         size_t got = 0;
         while (got < span) {
-            const ssize_t r = ::pread(fd, m + got, span - got, (off_t) (x.off + got));
+            const ssize_t r = dio::pread(fd, m + got, span - got, (int64_t) (x.off + got));
             if (r <= 0) break;
             got += (size_t) r;
         }
@@ -5441,16 +5705,17 @@ bool Ds41FileBlobs::open_mirror(const char* path, std::string& err) {
     moff_.swap(mo);
     mirrored_ = (int64_t) H.n;
     mfd_ = fd;
+    malign_ = dalign_ ? dio::direct_align(fd) : 0;   // in place on the mirror too when it is on for the model file
     std::fprintf(stderr, "blob mirror: %s - %lld experts (%.1f GiB), share %.3f of each mirrored blob's parts\n", path,
                  (long long) H.n, (double) (end - H.data) / 1073741824.0, mshare_ / 1000.0);
     return true;
 }
 
 bool Ds41FileBlobs::build_mirror(const std::string& out, const std::vector<std::pair<int32_t, int32_t>>& order,
-                                 uint64_t budget, std::string& err) const {
-    if (fd_ < 0) { err = "source not open"; return false; }
-    struct stat ss{};
-    ::fstat(fd_, &ss);
+                                 uint64_t budget, std::string& err, double keep_gib) const {
+    if (!opened_) { err = "source not open"; return false; }
+    dio::Stat ss{};
+    dio::fstat(dfd_ >= 0 ? dfd_ : buffered_fd(), &ss);
     std::vector<MirrorEnt> ent;
     std::vector<uint8_t> seen((size_t) (g_.n_layers * g_.n_experts), 0);
     uint64_t bytes = 0;
@@ -5470,11 +5735,36 @@ bool Ds41FileBlobs::build_mirror(const std::string& out, const std::vector<std::
         x.off = at;
         at += (expert_bytes(x.l, x.e) + 4095) & ~(uint64_t) 4095;
     }
-    const int fd = ::open(out.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644);
+    {   // never fill the target drive (on Windows often the system drive, with the pagefile): after the write at least
+        // max(keep_gib, 10% of the volume) must stay free.  A mirror being rebuilt in place gives its old size back.
+        const size_t sl = out.find_last_of("/\\");
+        std::string dir = sl == std::string::npos ? std::string(".") : out.substr(0, sl == 0 ? 1 : sl);
+        if (dir.size() == 2 && dir[1] == ':') dir += '\\';   // "C:\x.bin" -> "C:\"
+        uint64_t fr = 0, tot = 0, old = 0;
+        if (!dio::disk_space(dir, fr, tot)) { err = "cannot read the free space of " + dir + " (does the folder exist?)"; return false; }
+        const int ofd = dio::open(out.c_str(), O_RDONLY);
+        if (ofd >= 0) {
+            dio::Stat os{};
+            if (dio::fstat(ofd, &os) == 0) old = (uint64_t) os.st_size;
+            dio::close(ofd);
+        }
+        const uint64_t keep = std::max<uint64_t>((uint64_t) (std::max(0.0, keep_gib) * 1073741824.0), tot / 10);
+        const double G = 1073741824.0;
+        std::fprintf(stderr, "build-mirror: %zu experts, %.1f GiB to %s; free %.1f of %.1f GiB (+%.1f GiB of the old mirror), "
+                     "keeping %.1f GiB free\n", ent.size(), at / G, out.c_str(), fr / G, tot / G, old / G, keep / G);
+        if (fr + old < at + keep) {
+            char m[256];
+            std::snprintf(m, sizeof m, "not enough free space: %.1f GiB needed + %.1f GiB kept free, %.1f GiB free "
+                          "(lower --mirror-gib)", at / G, keep / G, (fr + old) / G);
+            err = m;
+            return false;
+        }
+    }
+    const int fd = dio::open(out.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644);
     if (fd < 0) { err = "cannot create " + out + " (O_DIRECT)"; return false; }
     auto wr = [&](const uint8_t* p, uint64_t n, uint64_t off) {
         while (n) {
-            const ssize_t k = ::pwrite(fd, p, (size_t) std::min<uint64_t>(n, 1u << 30), (off_t) off);
+            const ssize_t k = dio::pwrite(fd, p, (size_t) std::min<uint64_t>(n, 1u << 30), (int64_t) off);
             if (k <= 0) return false;
             p += k;
             off += (uint64_t) k;
@@ -5483,7 +5773,7 @@ bool Ds41FileBlobs::build_mirror(const std::string& out, const std::vector<std::
         return true;
     };
     {   // header + index
-        uint8_t* h = (uint8_t*) std::aligned_alloc(4096, (size_t) data);
+        uint8_t* h = (uint8_t*) dio::aligned_alloc(4096, (size_t) data);
         std::memset(h, 0, (size_t) data);
         MirrorHead H;
         std::memcpy(H.magic, "S41MIRR1", 8);
@@ -5493,13 +5783,13 @@ bool Ds41FileBlobs::build_mirror(const std::string& out, const std::vector<std::
         std::memcpy(h, &H, sizeof H);
         std::memcpy(h + sizeof H, ent.data(), ent.size() * sizeof(MirrorEnt));
         const bool ok = wr(h, data, 0);
-        std::free(h);
-        if (!ok) { ::close(fd); err = "header write failed"; return false; }
+        dio::aligned_free(h);
+        if (!ok) { dio::close(fd); err = "header write failed"; return false; }
     }
     // batches of kB blobs: 16 threads read the next batch (read_part, O_DIRECT) while this thread writes the last
     constexpr size_t kB = 48;
     const size_t stride = (max_ + 4095) & ~(size_t) 4095;
-    uint8_t* buf[2] = {(uint8_t*) std::aligned_alloc(4096, kB * stride), (uint8_t*) std::aligned_alloc(4096, kB * stride)};
+    uint8_t* buf[2] = {(uint8_t*) dio::aligned_alloc(4096, kB * stride), (uint8_t*) dio::aligned_alloc(4096, kB * stride)};
     auto fill = [&](size_t b0, uint8_t* dst) {
         const size_t n = std::min(kB, ent.size() - b0);
         constexpr int P = 8;
@@ -5533,10 +5823,10 @@ bool Ds41FileBlobs::build_mirror(const std::string& out, const std::vector<std::
                          (double) (ent[b0 + n - 1].off + expert_bytes(ent[b0 + n - 1].l, ent[b0 + n - 1].e) - data) /
                              ((now_ms() - t0) * 1e6));
     }
-    std::free(buf[0]);
-    std::free(buf[1]);
-    if (ok) ok = ::fsync(fd) == 0;
-    ::close(fd);
+    dio::aligned_free(buf[0]);
+    dio::aligned_free(buf[1]);
+    if (ok) ok = dio::fsync(fd) == 0;
+    dio::close(fd);
     if (!ok) { err = "write failed (disk full?)"; return false; }
     std::fprintf(stderr, "\nbuild-mirror: %s - %zu experts, %.2f GiB in %.1f s\n", out.c_str(), ent.size(),
                  (double) (at - data) / 1073741824.0, (now_ms() - t0) / 1000.0);
@@ -5552,11 +5842,26 @@ bool Ds41FileBlobs::read_direct(uint64_t off, size_t n, uint8_t* dst, uint8_t* s
     if (span > scratch_bytes) return false;
     size_t got = 0;
     while (got < span) {
-        const ssize_t k = ::pread(fd, scratch + got, span - got, (off_t) (a0 + got));
+        const ssize_t k = dio::pread(fd, scratch + got, span - got, (int64_t) (a0 + got));
         if (k <= 0) return false;
         got += (size_t) k;
     }
     std::memcpy(dst, scratch + (off - a0), n);
+    return true;
+}
+
+bool Ds41FileBlobs::read_inplace(uint64_t off, size_t n, uint8_t* dst, int fd, size_t A) const {
+    if (fd < 0) {
+        fd = dfd_;
+        A = dalign_;
+    }
+    if (!A || fd < 0 || !n || off % A || n % A || (uintptr_t) dst % A) return false;
+    size_t got = 0;
+    while (got < n) {
+        const ssize_t k = dio::pread(fd, dst + got, n - got, (int64_t) (off + got));
+        if (k <= 0) return false;
+        got += (size_t) k;
+    }
     return true;
 }
 
@@ -5582,7 +5887,7 @@ void Ds41FileBlobs::advise(int64_t layer, int64_t expert) const {
     Span s[3];
     spans(layer, expert, s);
     for (const Span& x : s)
-        if (x.bytes) ::posix_fadvise(fd_, (off_t) x.off, (off_t) x.bytes, POSIX_FADV_WILLNEED);
+        if (x.bytes) dio::posix_fadvise(fd_, (int64_t) x.off, (int64_t) x.bytes, POSIX_FADV_WILLNEED);
 }
 
 size_t Ds41FileBlobs::expert_bytes(int64_t l, int64_t e) const {
@@ -5608,7 +5913,7 @@ void Ds41FileBlobs::spans(int64_t l, int64_t e, Span s[3]) const {
 // bytes [lo, hi) of the blob [gate | up | down] into dst + lo
 static void pread_all(int fd, uint8_t* dst, uint64_t off, uint64_t n) {
     while (n) {
-        const ssize_t r = ::pread(fd, dst, (size_t) std::min<uint64_t>(n, 1u << 30), (off_t) off);
+        const ssize_t r = dio::pread(fd, dst, (size_t) std::min<uint64_t>(n, 1u << 30), (int64_t) off);
         if (r <= 0) {
             std::fprintf(stderr, "Ds41FileBlobs: pread failed at %llu\n", (unsigned long long) off);
             std::abort();
@@ -5620,11 +5925,21 @@ static void pread_all(int fd, uint8_t* dst, uint64_t off, uint64_t n) {
 }
 
 void Ds41FileBlobs::read(int64_t layer, int64_t expert, uint8_t* dst) const {
+#if defined(_WIN32)
+    // Windows: whole blobs (the RAM arena's 64 GiB seed above all) through the unbuffered twin too.  A buffered read
+    // gives the file a cache map, and while it lives NTFS checks cache coherency on every unbuffered read of the file:
+    // ds41_rdbench after 8 GiB read buffered (handle kept open) 7.06 -> 3.45 GB/s, back to 6.86 ~5 s after the close.
+    // read_part(.., 0, 1, ..) still falls back to the buffered pread for a span it cannot read unbuffered.
+    if (part_direct_ && dfd_ >= 0) {
+        read_part(layer, expert, 0, 1, dst);
+        return;
+    }
+#endif
     Span s[3];
     spans(layer, expert, s);
     uint64_t at = 0;
     for (const Span& x : s) {
-        pread_all(fd_, dst + at, x.off, x.bytes);
+        pread_all(buffered_fd(), dst + at, x.off, x.bytes);
         at += x.bytes;
     }
 }
@@ -5644,6 +5959,11 @@ void Ds41FileBlobs::read_part(int64_t layer, int64_t expert, int part, int npart
     if (mfd_ >= 0 && bb && nparts > 1 && ((part + 1) * mshare_) / 1000 != (part * mshare_) / 1000) {
         const uint64_t mo = moff_[(size_t) (layer * g_.n_experts + expert)];
         if (mo != ~0ull) {
+            // straight into dst where the piece is sector-aligned (Windows, as the model file's read_inplace)
+            if (read_inplace(mo + lo, (size_t) (hi - lo), dst + lo, mfd_, malign_)) {
+                give_bounce(bb);
+                return;
+            }
             const uint64_t step = (uint64_t) (scratch_ - 8192) & ~(uint64_t) 4095;
             bool ok = true;
             for (uint64_t a = lo; a < hi && ok; a += step)
@@ -5656,8 +5976,9 @@ void Ds41FileBlobs::read_part(int64_t layer, int64_t expert, int part, int npart
     }
     for (const Span& x : s) {
         const uint64_t a = std::max(lo, at), b = std::min(hi, at + x.bytes);
-        if (a < b && !(bb && read_direct(x.off + (a - at), (size_t) (b - a), dst + a, bb, scratch_)))
-            pread_all(fd_, dst + a, x.off + (a - at), b - a);
+        if (a < b && !(bb && (read_inplace(x.off + (a - at), (size_t) (b - a), dst + a) ||
+                              read_direct(x.off + (a - at), (size_t) (b - a), dst + a, bb, scratch_))))
+            pread_all(buffered_fd(), dst + a, x.off + (a - at), b - a);
         at += x.bytes;
     }
     if (bb) give_bounce(bb);

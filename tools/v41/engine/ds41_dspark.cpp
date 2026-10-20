@@ -217,6 +217,10 @@ bool Ds41DSpark::Impl::load(std::string & e) {
         if (h->ne[0] != (int64_t) out->shape[0] || h->ne[1] != (int64_t) out->shape[1]) { e = "shared_head: shape differs from output.weight"; return false; }
         w["output.weight"] = cfg.shared_head;
     }
+    if (cfg.token_embd) {
+        embd = cfg.token_embd;
+        return true;
+    }
     size_t se = 0;
     main->find("token_embd.weight", &se);
     embd = main->shard(se).tensor_data(*te);
@@ -241,6 +245,11 @@ bool Ds41DSpark::init(const Ds41DSparkConfig & cfg, std::string & err) {
     im.OGD = G.n_head * G.d_head / G.o_groups; im.NFF = G.n_ff; im.V = G.vocab; im.BS = cfg.block; im.KM = cfg.max_append;
     im.NU = cfg.n_used;
     if (!im.load(err)) return false;
+#if defined(_WIN32)
+    // with the embeddings handed in, nothing reads the trunk's mapping after load: drop it (Ds41Dense::token_embd -
+    // a live mapping of the model file slows every unbuffered expert read)
+    if (cfg.token_embd) im.main.reset();
+#endif
     im.NE = im.BW(0, "ffn.experts.w1.weight")->ne[2];
     if (im.BW(0, "main_proj.weight")->ne[0] != 3 * im.D) { err = "mtp.0.main_proj is not [3*n_embd, n_embd]"; return false; }
     // state + inputs

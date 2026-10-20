@@ -232,10 +232,13 @@ public:
     /// 0.28 = 2 of 8 parts: the rb2 microbench (6.75 MiB blobs, 8 parts, 32 threads) gives the model drive 6.22 GB/s,
     /// the mirror 3.26, and the pair 8.29 at 2/8 vs 7.95 at 3/8 - the mirror's own ceiling, so a larger share only
     /// unloads the faster drive (8.13 at 1/4 with independent offsets; 3/8's 2% is inside the engine's noise).
+    /// Two equal drives want 0.5: Windows, 990 PRO + 980 PRO on separate links, prompt file tier 6.85 -> 11.3 GB/s
+    /// (0.4: 10.3, 0.6: 11.4; docs/WINDOWS_DS41.md "Second SSD") - set there through the config's env.
     int64_t mirrored() const { return mirrored_; }
-    /// Writes the mirror: `order` coldest first, until `budget` bytes.  Returns false with `err` on failure.
+    /// Writes the mirror: `order` coldest first, until `budget` bytes.  Refuses (before writing) unless at least
+    /// max(`keep_gib`, 10% of the volume) stays free after it.  Returns false with `err` on failure.
     bool build_mirror(const std::string& out, const std::vector<std::pair<int32_t, int32_t>>& order, uint64_t budget,
-                      std::string& err) const;
+                      std::string& err, double keep_gib = 100.0) const;
 
 private:
     struct Span { uint64_t off = 0, bytes = 0; };
@@ -243,8 +246,13 @@ private:
     /// One 4096-aligned `pread` of [off, off+n) through the O_DIRECT twin fd, sliced out of `scratch`.  False when
     /// there is no twin fd or the bounce is too small (the caller then falls back to the buffered `read`).
     bool read_direct(uint64_t off, size_t n, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes, int fd = -1) const;
+    /// [off, off+n) straight into dst through the O_DIRECT twin, no bounce - when off, n and dst are all multiples of
+    /// `dalign_`.  False (nothing assumed about dst) when they are not, there is no twin, or a read fails.
+    /// `fd` / `A`: another O_DIRECT file and its alignment (the mirror) instead of the twin and `dalign_`.
+    bool read_inplace(uint64_t off, size_t n, uint8_t* dst, int fd = -1, size_t A = 0) const;
     bool open_mirror(const char* path, std::string& err);
     int mfd_ = -1;                        ///< the mirror (O_DIRECT), -1 = none
+    size_t malign_ = 0;                   ///< read_inplace's alignment on the mirror (0 = off, as dalign_)
     std::vector<uint64_t> moff_;          ///< per (layer, expert): the blob's offset in the mirror, ~0 = not mirrored
     int64_t mirrored_ = 0;
     int mshare_ = 280;                    ///< per mille of a mirrored blob's parts read from the mirror
@@ -255,8 +263,15 @@ private:
     mutable std::vector<uint8_t*> bfree_, ball_;
     bool part_direct_ = true;    ///< read_part through the O_DIRECT twin (STRATA_DECODE_DIRECT=0: buffered)
     std::string path_;
-    int fd_ = -1;
+    /// The buffered fd (unaligned fallback reads, the mirror's size check).  Windows opens it on first use only: an
+    /// open buffered handle opened right after GgufModel's mapping keeps the file's cache state alive, and with it NTFS
+    /// checks cache coherency on every unbuffered read (7.0 -> 3.4 GB/s for the whole run).  POSIX: opened in open().
+    int buffered_fd() const;
+    mutable int fd_ = -1;
+    mutable std::once_flag fd_once_;
+    bool opened_ = false;
     int dfd_ = -1;               ///< O_DIRECT twin of fd_ (-1 where the filesystem refused it)
+    size_t dalign_ = 0;          ///< read_inplace's alignment (dio::direct_align: Windows only), 0 = off
     size_t scratch_ = 0;         ///< the aligned bounce one read_direct span needs
     Ds41MoeGeom g_;
     size_t max_ = 0;
@@ -313,6 +328,10 @@ struct Ds41MoeConfig {
     /// Prompt chunks: while layer l's experts compute (and the caller runs layer l+1's dense half), DMA layer l+1's
     /// arena experts into the other device half, which is then sized to a whole layer.  Off with arena_adapt.
     bool chunk_prestage = false;
+    /// Prompt chunks with chunk_mmq: VRAM-resident experts on MMQ too (copied device-to-device into the stage halves at
+    /// MMQ's stride), not the grouped MMVQ kernel.  The --gpu2 worker sets it (every expert it computes is resident);
+    /// off elsewhere, so the one-card path keeps its kernels and its bits.
+    bool chunk_resident_mmq = false;
     /// Prompt chunks: while layer l computes, a background reader pool fills a pinned host slab with layer l+1's
     /// FILE-TIER experts (neither VRAM-resident nor in the RAM arena), so run_chunk(l+1) DMAs straight out of the slab
     /// instead of reading on its own critical path.  Two slabs ping-pong; a layer that fits neither falls back to
@@ -363,10 +382,13 @@ struct Ds41MoeStats {
     int64_t vram_swaps = 0;         ///< vram_lru: misses / prefetches moved into a VRAM slot
     int64_t vram_demotes = 0;       ///< ...of which the victim went back to the arena (it had no arena copy)
     int64_t skipped = 0;            ///< skip_miss: low-weight misses dropped
+    int64_t remote = 0;             ///< --gpu2: routed entries computed on the second card (not in the counts above)
 
     void add(const Ds41MoeStats& o);
     int64_t lookups() const { return hits + cpu + pcie + skipped; }
 };
+
+class Ds41Gpu2;   // ds41_gpu2.hpp
 
 /// The tier's private state, defined in ds4_moe.cpp.  It carries the CUDA members in a CUDA build and none in a
 /// CPU-only one, which is what keeps this header - and every binary linking it - free of a CUDA dependency.
@@ -477,6 +499,12 @@ public:
     /// caller record (the pass's acceptance).  Replayed by tools/v41/sim/route_sim.py.
     void trace_open(const std::string& path);
     void trace_mark(const float* v, int n);
+    /// --gpu2 (ds41_gpu2.hpp, CUDA tier only): the experts `r` holds are computed on the second card - every run* call
+    /// sends their rows there and computes the rest itself meanwhile, then adds the second card's sums.  The caller
+    /// also puts r->owned() into Ds41MoeConfig::exclude (before init), so this card neither caches nor arenas them.
+    /// After a failed call the tier stops sending and computes those experts itself (from the file tier).
+    /// nullptr = off: every call is exactly the one-card path.
+    bool set_remote(Ds41Gpu2* r, std::string& err);
     /// cudaProfilerStart / Stop (nsys --capture-range=cudaProfilerApi); a no-op without CUDA.
     static void profiler(bool on);
     /// A prompt chunk: `n` tokens (any count) of one layer, `ids`/`w` n*top_k token-major, `x`/`out` n*n_embd.  GPU

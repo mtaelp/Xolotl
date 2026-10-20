@@ -167,6 +167,11 @@ public:
     /// is the current count.  A no-op when unchanged.
     bool set_columns(int nc);
     int columns() const;
+    /// The F16 token_embd rows (n_vocab x n_embd).  On Windows with a GPU backend they are a private copy and the
+    /// dense half holds no mapping of the model file after init: while any mapping (or cached handle) of the file is
+    /// alive, NTFS checks cache coherency on every unbuffered expert read, which cut the prompt's file-tier reads from
+    /// 7.0 to ~3.8 GB/s (docs/WINDOWS_DS41.md).  Elsewhere they sit on the mapping.
+    const uint8_t * token_embd() const;
     /// Gate tap: an index source layer's top-k rows of the current pass (n * K ints, token-major; K = min(cap, top-k))
     /// and their visibility mask; empty for other layers.
     bool read_sel(int il, std::vector<int> & sel, std::vector<float> & mask, int * K);

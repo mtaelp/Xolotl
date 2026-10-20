@@ -1,4 +1,5 @@
 // tools/v41/engine/ds41_dense.cpp - see ds41_dense.hpp.  Line references are to DeepSeek's inference/model.py.
+#include "ds41_io.hpp"
 #include "ds41_dense.hpp"
 
 #include "ds41_engram.hpp"
@@ -22,7 +23,6 @@
 #include <set>
 #include <thread>
 
-#include <strings.h>
 
 using namespace strata;
 using namespace strata::v41;
@@ -201,7 +201,8 @@ struct Ds41Dense::Impl {
     std::vector<std::array<int64_t, 3>> span_cap;   // [sub-batch][ratio] pass_cap
     std::vector<float> host_fn, host_wts, host_logits, host_emb;
     std::vector<int32_t> host_ids;
-    const uint8_t * embd = nullptr;       // token_embd F16 rows on the mmap
+    const uint8_t * embd = nullptr;       // token_embd F16 rows on the mmap (Windows + GPU: in embd_own)
+    std::vector<uint8_t> embd_own;
     std::vector<std::vector<float>> eng_rows;
     // The pass's Engram reads, started (async) by upload_inputs and waited at the first Engram layer's span /
     // attn_router: the whole pass's rows are read from disk while the embeddings, the init graph and the layers below
@@ -283,7 +284,7 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
         ggml_type rq = GGML_TYPE_COUNT;
         if (const char * e = std::getenv("STRATA_DENSE_REQUANT"); e && *e)
             for (int t = 0; t < GGML_TYPE_COUNT; ++t)
-                if (ggml_get_type_traits((ggml_type) t)->type_name && strcasecmp(ggml_type_name((ggml_type) t), e) == 0) rq = (ggml_type) t;
+                if (ggml_get_type_traits((ggml_type) t)->type_name && dio::strcasecmp(ggml_type_name((ggml_type) t), e) == 0) rq = (ggml_type) t;
         const bool rq_head = !(std::getenv("STRATA_DENSE_REQUANT_HEAD") && std::getenv("STRATA_DENSE_REQUANT_HEAD")[0] == '0');
         auto requant = [&](const TensorInfo & ti) {
             return rq != GGML_TYPE_COUNT && (ggml_type) ti.type == GGML_TYPE_Q8_0 && ti.shape.size() == 2 &&
@@ -295,7 +296,7 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
         ggml_type pq = GGML_TYPE_COUNT;
         if (const char * e = std::getenv("STRATA_PRED_ROUTER"); e && *e)
             for (int t = 0; t < GGML_TYPE_COUNT; ++t)
-                if (ggml_get_type_traits((ggml_type) t)->type_name && strcasecmp(ggml_type_name((ggml_type) t), e) == 0) pq = (ggml_type) t;
+                if (ggml_get_type_traits((ggml_type) t)->type_name && dio::strcasecmp(ggml_type_name((ggml_type) t), e) == 0) pq = (ggml_type) t;
         auto pred_name = [&](const TensorInfo & ti) -> std::string {   // "" = no prediction copy for this tensor
             static const std::string suf = "ffn_gate_inp.weight";
             const std::string & n = ti.name;
@@ -1005,6 +1006,7 @@ bool Ds41Dense::set_columns(int nc) {
 }
 
 int Ds41Dense::columns() const { return (int) p_->NC; }
+const uint8_t * Ds41Dense::token_embd() const { return p_->embd; }
 
 bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std::string & err) {
     Impl & im = *p_;
@@ -1048,6 +1050,20 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     }
     im.cpu = ggml_backend_is_cpu(im.backend);
     if (!load_weights(im, err)) return false;
+#if defined(_WIN32)
+    // A GPU backend has every dense weight on the card now; only the embedding rows were still read through the
+    // mapping.  Copy them and drop the mapping: a live mapping of the model file costs every unbuffered expert read an
+    // NTFS coherency check (ds41_rdbench: 7.05 -> 3.75 GB/s with the file merely mapped).  The CPU backend binds its
+    // weights to the mapping and keeps it.
+    if (!im.cpu) {
+        const TensorInfo * te = im.model->find("token_embd.weight");
+        if (!te || te->type != GGML_TYPE_F16 || te->shape.size() < 2) { err = "token_embd.weight must be F16 [n_embd, n_vocab]"; return false; }
+        const size_t eb = (size_t) te->shape[0] * (size_t) te->shape[1] * 2;
+        im.embd_own.assign(im.embd, im.embd + eb);
+        im.embd = im.embd_own.data();
+        im.model.reset();
+    }
+#endif
     if (!cfg.engram_dirs.empty() && !im.engram.open(G, cfg.engram_dirs, cfg.engram_threads, err)) return false;
 
     // layers

@@ -12,15 +12,14 @@
 #pragma once
 
 #include "strata/artifact/gguf_reader.hpp"
+#include "ds41_io.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <fcntl.h>
 #include <map>
 #include <set>
 #include <string>
-#include <unistd.h>
 #include <vector>
 
 namespace strata::v41 {
@@ -102,7 +101,7 @@ struct Rd {
         if (at >= buf_at && at + n <= buf_at + buf.size()) return true;
         const size_t want = std::max<size_t>(n, 1 << 20);
         buf.resize(want);
-        const ssize_t r = pread(fd, buf.data(), want, (off_t) at);
+        const ssize_t r = dio::pread(fd, buf.data(), want, (int64_t) at);
         if (r < (ssize_t) n) return false;
         buf.resize((size_t) r);
         buf_at = at;
@@ -129,9 +128,9 @@ inline size_t scalar_size(uint32_t t) {
 
 inline std::string ds41_read_int_array(const std::string & path, const std::string & key, std::vector<int64_t> & out) {
     detail::Rd r;
-    r.fd = ::open(path.c_str(), O_RDONLY);
+    r.fd = dio::open(path.c_str(), O_RDONLY);
     if (r.fd < 0) return "cannot open " + path;
-    struct Closer { int fd; ~Closer() { ::close(fd); } } closer { r.fd };
+    struct Closer { int fd; ~Closer() { dio::close(fd); } } closer { r.fd };
     uint32_t magic = 0, version = 0;
     uint64_t n_t = 0, n_kv = 0;
     if (!r.get(magic) || magic != 0x46554747u || !r.get(version) || !r.get(n_t) || !r.get(n_kv)) return "bad GGUF header";

@@ -100,3 +100,35 @@ void ds41_ptq1_to_q2_0(const void* src, void* dst, size_t ptq1_bytes, void* stre
     const int64_t grid = (nb * 32 + threads - 1) / threads;
     k_ptq1_to_q2_0<<<(unsigned) grid, threads, 0, (cudaStream_t) stream>>>((const Ptq1Block*) src, (Q20Block*) dst, nb);
 }
+
+// --gpu2 (ds41_gpu2.hpp): dst[rows[r] * H + i] += src[r * H + i] - the second card's partial sums into the caller's rows
+namespace {
+__global__ void k_add_rows(float* __restrict__ dst, const int32_t* __restrict__ rows, const float* __restrict__ src, int64_t H) {
+    const int64_t r = blockIdx.y;
+    float* d = dst + (int64_t) rows[r] * H;
+    const float* s = src + r * H;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < H; i += (int64_t) gridDim.x * blockDim.x) d[i] += s[i];
+}
+}  // namespace
+
+void ds41_add_rows_f32(float* dst, const int32_t* rows, const float* src, int nrows, int64_t H, void* stream) {
+    if (nrows <= 0) return;
+    for (int r0 = 0; r0 < nrows; r0 += 65535) {   // grid.y <= 65535
+        const int nr = nrows - r0 < 65535 ? nrows - r0 : 65535;
+        const dim3 grid((unsigned) ((H + 255) / 256 < 16 ? (H + 255) / 256 : 16), (unsigned) nr);
+        k_add_rows<<<grid, 256, 0, (cudaStream_t) stream>>>(dst, rows + r0, src + (int64_t) r0 * H, H);
+    }
+}
+
+// --gpu2 worker (STRATA_GPU2_WARM): one block that spins for `us` microseconds - keeps a lightly used card at its full
+// clocks between decode calls (the driver drops an idle-ish card to ~700 MHz core / half memory clock)
+namespace {
+__global__ void k_spin(long long cycles) {
+    const long long t0 = clock64();
+    while (clock64() - t0 < cycles) { }
+}
+}  // namespace
+
+void ds41_spin_us(double us, int clock_khz, void* stream) {
+    k_spin<<<1, 32, 0, (cudaStream_t) stream>>>((long long) (us * (double) clock_khz / 1000.0));
+}

@@ -65,3 +65,17 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/cmake/ds4_engine.cmake OPTIONAL)
 
 # DeepSeek-V4.1 engine (tools/v41/engine)
 include(${CMAKE_CURRENT_SOURCE_DIR}/tools/v41/engine/v41_engine.cmake OPTIONAL)
+
+# ODR fix (found on Windows/MSVC): strata_mmq / strata_mmq_w4a4 / strata_kq include ggml-cuda's common.cuh and
+# construct ggml_backend_cuda_context themselves (moe_mmq.cu: `new ggml_backend_cuda_context(dev)`).  With
+# STRATA_GGML_CUDA, ggml-cuda is built with GGML_CUDA_USE_GRAPHS (add_compile_definitions in its own directory),
+# which adds members to that struct (cuda_graphs map, ...).  Without the same define here the two copies of the
+# inline constructor disagree on the layout; MSVC's linker kept the larger one, which built the map past the end of
+# the smaller allocation and corrupted the heap on the first prompt (0xC0000374).  Same define = one layout.
+if(GGML_CUDA_GRAPHS)
+  foreach(_t strata_mmq strata_mmq_w4a4 strata_kq)
+    if(TARGET ${_t})
+      target_compile_definitions(${_t} PRIVATE GGML_CUDA_USE_GRAPHS)
+    endif()
+  endforeach()
+endif()

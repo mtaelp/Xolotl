@@ -7,6 +7,19 @@
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+#endif
+// MSVC compiles AVX2 intrinsics without a per-function target (the callers check cpu_avx2_ok at run time)
+#if defined(_MSC_VER) && !defined(__clang__)
+#define PTQ1_TARGET(x)
+#define PTQ1_HAS_F16C_FMA true   // cpu_avx2_ok() already checks FMA and F16C
+#if defined(_M_X64)
+static inline float _cvtsh_ss(unsigned short h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int) h))); }
+#endif
+#else
+#define PTQ1_TARGET(x) __attribute__((target(x)))
+#define PTQ1_HAS_F16C_FMA (__builtin_cpu_supports("f16c") && __builtin_cpu_supports("fma"))
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
 #define STRATA_PTQ1_X86 1
 #endif
 
@@ -151,7 +164,7 @@ void ptq1_0_vec_dot_q8_0_scalar(int n, float* s, const void* vx, const void* vy)
 #if STRATA_PTQ1_X86
 namespace {
 // 16 bytes -> for trit n: 16 digits (uint8 0..2) of trit n of each byte
-__attribute__((target("avx2"))) inline __m128i trits16(__m128i b, int n) {
+PTQ1_TARGET("avx2") inline __m128i trits16(__m128i b, int n) {
     const __m256i w = _mm256_cvtepu8_epi16(b);
     const __m256i p = _mm256_mullo_epi16(w, _mm256_set1_epi16(kPow3[n]));
     const __m256i lo = _mm256_and_si256(p, _mm256_set1_epi16(0xff));
@@ -159,7 +172,7 @@ __attribute__((target("avx2"))) inline __m128i trits16(__m128i b, int n) {
     return _mm_packus_epi16(_mm256_castsi256_si128(dg), _mm256_extracti128_si256(dg, 1));
 }
 // sum over 32 lanes of digits (u8) * q (i8) and of q, as int32 (both exact)
-__attribute__((target("avx2"))) inline void dot32(__m256i dg, __m256i q, int& dq, int& sq) {
+PTQ1_TARGET("avx2") inline void dot32(__m256i dg, __m256i q, int& dq, int& sq) {
     const __m256i one16 = _mm256_set1_epi16(1);
     const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(dg, q), one16);                     // digits <= 2: no i16 saturation
     const __m256i s = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_set1_epi8(1), q), one16);
@@ -169,7 +182,7 @@ __attribute__((target("avx2"))) inline void dot32(__m256i dg, __m256i q, int& dq
     c = _mm_hadd_epi32(c, c); c = _mm_hadd_epi32(c, c);
     dq = _mm_cvtsi128_si32(a); sq = _mm_cvtsi128_si32(c);
 }
-__attribute__((target("avx2"))) void dot_avx2(int n, float* s, const uint8_t* x, const Q8* y) {
+PTQ1_TARGET("avx2") void dot_avx2(int n, float* s, const uint8_t* x, const Q8* y) {
     alignas(32) uint8_t dg[kPtq1Block];
     float acc = 0.f;
     for (int b = 0; b < n / kPtq1Block; ++b) {
@@ -196,15 +209,15 @@ __attribute__((target("avx2"))) void dot_avx2(int n, float* s, const uint8_t* x,
 // ---- ptq1_0_rows_q8_0's AVX2 kernel: a block's 128 digits decoded once (16-bit lanes: digit n of a byte b is
 // ((uint8)(b * 3^n) * 3) >> 8), as -1 / 0 / +1 bytes; per token and 32-weight sub-block sum(sign(q, t - 1)) in int32
 // - exactly the scalar dot's integer - then * d_a in fp32, * d_w per block, one horizontal sum a row.
-__attribute__((target("avx2,fma,f16c"))) inline __m256i rtrit16(__m256i w, __m256i pw) {
+PTQ1_TARGET("avx2,fma,f16c") inline __m256i rtrit16(__m256i w, __m256i pw) {
     const __m256i p = _mm256_and_si256(_mm256_mullo_epi16(w, pw), _mm256_set1_epi16(0xff));
     return _mm256_srli_epi16(_mm256_add_epi16(p, _mm256_add_epi16(p, p)), 8);
 }
-__attribute__((target("avx2,fma,f16c"))) inline __m256i rpack(__m256i a, __m256i b) {
+PTQ1_TARGET("avx2,fma,f16c") inline __m256i rpack(__m256i a, __m256i b) {
     return _mm256_permute4x64_epi64(_mm256_packus_epi16(a, b), 0xD8);
 }
 // one block -> 4 x 32 signed trits in element order (qs[0..15]: 16 n + m; qs[16..23]: 80 + m + 8 n; qh: 120 + h + 2 n)
-__attribute__((target("avx2,fma,f16c"))) inline void runpack(const uint8_t* blk, __m256i dg[4]) {
+PTQ1_TARGET("avx2,fma,f16c") inline void runpack(const uint8_t* blk, __m256i dg[4]) {
     const __m256i w = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*) blk));
     const __m256i t0 = rtrit16(w, _mm256_set1_epi16(1)), t1 = rtrit16(w, _mm256_set1_epi16(3));
     const __m256i t2 = rtrit16(w, _mm256_set1_epi16(9)), t3 = rtrit16(w, _mm256_set1_epi16(27));
@@ -222,14 +235,14 @@ __attribute__((target("avx2,fma,f16c"))) inline void runpack(const uint8_t* blk,
     dg[2] = _mm256_sub_epi8(rpack(t4, u01), one8);
     dg[3] = _mm256_sub_epi8(rpack(u23, u4), one8);
 }
-__attribute__((target("avx2,fma,f16c"))) inline float rhsum(__m256 v) {
+PTQ1_TARGET("avx2,fma,f16c") inline float rhsum(__m256 v) {
     __m128 a = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
     a = _mm_add_ps(a, _mm_movehl_ps(a, a));
     a = _mm_add_ss(a, _mm_movehdup_ps(a));
     return _mm_cvtss_f32(a);
 }
 template <int NT>
-__attribute__((target("avx2,fma,f16c"))) void rows_avx2(const uint8_t* w, size_t rb, int n, const Q8* const* y, float* const* out, int r0, int r1) {
+PTQ1_TARGET("avx2,fma,f16c") void rows_avx2(const uint8_t* w, size_t rb, int n, const Q8* const* y, float* const* out, int r0, int r1) {
     const __m256i ones16 = _mm256_set1_epi16(1), ones8 = _mm256_set1_epi8(1);
     for (int r = r0; r < r1; ++r) {
         const uint8_t* x = w + (size_t) r * rb;
@@ -261,7 +274,7 @@ __attribute__((target("avx2,fma,f16c"))) void rows_avx2(const uint8_t* w, size_t
 
 void ptq1_0_rows_q8_0(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out, int r0, int r1) {
 #if STRATA_PTQ1_X86
-    static const bool avx2 = cpu_avx2_ok() && __builtin_cpu_supports("f16c") && __builtin_cpu_supports("fma");
+    static const bool avx2 = cpu_avx2_ok() && PTQ1_HAS_F16C_FMA;
     if (avx2) {
         // tokens in groups of <= 4 (the accumulators stay in registers)
         for (int t0 = 0; t0 < nt; t0 += 4) {

@@ -8,6 +8,9 @@
 //                 [--vram-lru] [--arena-adapt] [--pcie 0.25] [--tier-batch-pcie 1.0] [--prefill-chunk N] [--prompt-batch B] [--chunk-mmq] [--ctx N]
 //                 [--temp 0] [--seed 1] [--stop id,id] [--ppl] [--no-actquant] [--kv-fp4] [--serve] [--quiet]
 //                 [--enc-skip|--no-enc-skip] [--enc-replay N] [--dump-last F]
+//                 [--gpu2 N [--gpu2-reserve GiB] [--gpu2-gib GiB] [--gpu2-skip GiB|auto] [--gpu2-piece rows]]
+// --gpu2 N (Windows): card N (as nvidia-smi numbers it) holds a second VRAM expert cache in a helper process
+// (ds41_gpu2.hpp; docs/WINDOWS_DS41.md "Dual GPU").  Off by default: one card, exactly as before.
 // --enc-skip (layer-major batches only; DEFAULT for one-shot runs, --no-enc-skip = full path): prompt tokens before the last --enc-replay (default 2560 = 128 * 20) stop
 // after layer 20's persistent-KV writes; only the last 2560 tokens run layers 21-39.  Same last-token logits / decode.
 //
@@ -23,6 +26,8 @@
 //
 // Load the real model only through tools/ds4/memguard.sh (RAM cap + the shared GPU lock).
 #include "ds41_dense.hpp"
+#include "ds41_gpu2.hpp"
+#include "ds41_io.hpp"
 #include "ds41_moe.hpp"
 #if defined(DS41_HAVE_DSPARK)
 #include "ds41_dspark.hpp"
@@ -56,10 +61,17 @@ using namespace strata::v41;
 
 namespace {
 
+#if defined(_WIN32)
+constexpr char kPathSep = ';';
+#else
+constexpr char kPathSep = ':';
+#endif
+
 struct Args {
     std::string model, ids_csv, ids_file, rank, dump_logits, dump_last;
     std::string build_mirror;      // --build-mirror F [--mirror-gib N]: write the blob mirror (coldest experts by --rank) and exit
     double mirror_gib = 85.0;
+    double mirror_keep_gib = 100.0;   // --mirror-keep-gib N: --build-mirror leaves max(N, 10% of the volume) free
     std::string prune;            // --prune F: "layer expert" lines (coldest first - v41_prune_list.py), soft or hard pruned
     float prune_penalty = 0.0f;   // --prune-penalty X: selection bias -X on the listed experts (0 = masked out of routing)
     float route_bias_file = 0.6f;    // --route-bias-file X: selection penalty -X on file-tier experts (neither VRAM nor RAM arena);
@@ -86,6 +98,12 @@ struct Args {
     int  enc_replay = 2560;       // --enc-replay N: the replay window (window_size * (n_layer - cand_layer) = 128*20)
     float skip_miss = 0.0f, skip_file = 0.0f;
     double chunk_prefetch_gib = 0.0;
+    int gpu2 = -1;                // --gpu2 N: the second card (nvidia-smi index), -1 = off
+    double gpu2_reserve = 3.0;    // --gpu2-reserve GiB: VRAM the second card keeps for its buffers
+    double gpu2_gib = 0.0;        // --gpu2-gib GiB: cap on its expert slots (0 = all it can hold)
+    int gpu2_piece = 4096;        // --gpu2-piece rows: rows per worker prompt call (its buffers scale with it)
+    double gpu2_skip = 0.0;       // --gpu2-skip GiB|auto: the ranking's head left to this card's decode cache (auto: its expert
+                                  // slot budget).  Default 0: the second card takes the head (prompts +5%, decode the same)
 };
 
 std::vector<int> parse_csv(const std::string & s) {
@@ -106,7 +124,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "-n" || k == "--n-predict") a.n_predict = std::atoi(next().c_str());
         else if (k == "--backend") a.backend = next();
         else if (k == "--experts") a.experts = next();
-        else if (k == "--engram") { std::stringstream ss(next()); std::string d; while (std::getline(ss, d, ':')) a.engram.push_back(d); }
+        else if (k == "--engram") { std::stringstream ss(next()); std::string d; while (std::getline(ss, d, kPathSep)) a.engram.push_back(d); }
         else if (k == "--slots") { const std::string v = next(); a.slots = v == "auto" ? 0 : std::atoll(v.c_str()); }
         else if (k == "--vram-margin") a.vram_margin_gib = std::atof(next().c_str());
         else if (k == "--arena-gib") a.arena_gib = std::atof(next().c_str());
@@ -114,6 +132,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--build-mirror") a.build_mirror = next();
         else if (k == "--check-mirror") { a.build_mirror = next(); a.mirror_gib = -1; }
         else if (k == "--mirror-gib") a.mirror_gib = std::atof(next().c_str());
+        else if (k == "--mirror-keep-gib") a.mirror_keep_gib = std::atof(next().c_str());
         else if (k == "--vram-lru") a.vram_lru = true;
         else if (k == "--no-vram-lru") a.vram_lru = false;
         else if (k == "--arena-adapt") a.arena_adapt = true;
@@ -151,6 +170,11 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--enc-skip") a.enc_skip = 1;
         else if (k == "--no-enc-skip") a.enc_skip = 0;
         else if (k == "--enc-replay") a.enc_replay = std::atoi(next().c_str());
+        else if (k == "--gpu2") a.gpu2 = std::atoi(next().c_str());
+        else if (k == "--gpu2-reserve") a.gpu2_reserve = std::atof(next().c_str());
+        else if (k == "--gpu2-gib") a.gpu2_gib = std::atof(next().c_str());
+        else if (k == "--gpu2-piece") a.gpu2_piece = std::atoi(next().c_str());
+        else if (k == "--gpu2-skip") { const std::string v = next(); a.gpu2_skip = v == "auto" ? -1.0 : std::atof(v.c_str()); }
         else { std::fprintf(stderr, "unknown argument %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && (a.serve || !a.ids_csv.empty() || !a.ids_file.empty() || !a.build_mirror.empty());
@@ -239,7 +263,81 @@ double log_softmax_at(const float * lg, int nv, int tok) {
 
 }  // namespace
 
+#if defined(_WIN32)
+#include <dbghelp.h>
+// Windows: a crash (access violation, heap corruption, ...) prints its call stack to stderr - the engine log - before
+// the process ends.  Linux has the core dump / GGML backtrace for this.
+namespace {
+void ds41_print_stack(CONTEXT) {
+    // RtlCaptureStackBackTrace unwinds this thread from here: the handler's frames, the exception dispatch, then the
+    // faulting code and its callers (StackWalk64 from the exception context failed inside a corrupted heap)
+    void * fr[62];
+    const USHORT nf = RtlCaptureStackBackTrace(0, 62, fr, nullptr);
+    HANDLE proc = GetCurrentProcess();
+    char exe[MAX_PATH] = "";
+    GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    if (char * sl = std::strrchr(exe, '\\')) *sl = 0;
+    SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+    const bool sym = SymInitialize(proc, exe, TRUE) != FALSE;
+    alignas(SYMBOL_INFO) char sb[sizeof(SYMBOL_INFO) + 512];
+    for (USHORT i = 0; i < nf; ++i) {
+        const DWORD64 pc = (DWORD64) fr[i];
+        char mod[MAX_PATH] = "?";
+        HMODULE hm = nullptr;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR) fr[i], &hm))
+            GetModuleFileNameA(hm, mod, MAX_PATH);
+        const char * mn = std::strrchr(mod, '\\');
+        mn = mn ? mn + 1 : mod;
+        SYMBOL_INFO * si = (SYMBOL_INFO *) sb;
+        std::memset(sb, 0, sizeof sb);
+        si->SizeOfStruct = sizeof(SYMBOL_INFO);
+        si->MaxNameLen = 511;
+        DWORD64 d = 0;
+        IMAGEHLP_LINE64 ln{};
+        ln.SizeOfStruct = sizeof ln;
+        DWORD ld = 0;
+        const bool hs = sym && SymFromAddr(proc, pc, &d, si);
+        if (hs && SymGetLineFromAddr64(proc, pc, &ld, &ln))
+            std::fprintf(stderr, "  #%02u %s!%s+0x%llx  %s:%lu\n", i, mn, si->Name, (unsigned long long) d, ln.FileName, ln.LineNumber);
+        else
+            std::fprintf(stderr, "  #%02u %s!%s+0x%llx (+0x%llx)\n", i, mn, hs ? si->Name : "?", (unsigned long long) d,
+                         (unsigned long long) (pc - (DWORD64) hm));
+    }
+    std::fflush(stderr);
+}
+LONG WINAPI ds41_crash(EXCEPTION_POINTERS * ep) {
+    const DWORD code = ep->ExceptionRecord->ExceptionCode;
+    // first-chance access violations can be handled further up (the CUDA driver probes memory): only the vectored
+    // pass for heap corruption, the unhandled filter (below) for everything else
+    if (code != 0xC0000374u) return EXCEPTION_CONTINUE_SEARCH;
+    static LONG once = 0;
+    if (InterlockedExchange(&once, 1)) return EXCEPTION_CONTINUE_SEARCH;
+    std::fprintf(stderr, "ds41_generate: crash 0x%08lx (heap corruption) on thread %lu - stack:\n", code, GetCurrentThreadId());
+    ds41_print_stack(*ep->ContextRecord);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+LONG WINAPI ds41_unhandled(EXCEPTION_POINTERS * ep) {
+    static LONG once = 0;
+    if (InterlockedExchange(&once, 1)) return EXCEPTION_CONTINUE_SEARCH;
+    std::fprintf(stderr, "ds41_generate: crash 0x%08lx at %p on thread %lu - stack:\n", ep->ExceptionRecord->ExceptionCode,
+                 ep->ExceptionRecord->ExceptionAddress, GetCurrentThreadId());
+    ds41_print_stack(*ep->ContextRecord);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+}  // namespace
+#endif
+// DS41_HEAP_CHECK=1 (Windows): the heaps validated at the load / prompt checkpoints (ds41_io.hpp)
+static void heap_check(const char * where) { dio::heap_check(where); }
+
 int main(int argc, char ** argv) {
+#if defined(_WIN32)
+    AddVectoredExceptionHandler(1, ds41_crash);
+    SetUnhandledExceptionFilter(ds41_unhandled);
+#endif
+    // --gpu2's helper process (started by the engine below): ds41_generate --gpu2-worker <mapping> <engine pid>
+    if (argc >= 4 && std::strcmp(argv[1], "--gpu2-worker") == 0)
+        return ds41_gpu2_worker_main(argv[2], std::strtoul(argv[3], nullptr, 10));
     if (!std::getenv("DS41_GGML_DEBUG"))
         ggml_log_set([](ggml_log_level lv, const char * text, void *) { if (lv != GGML_LOG_LEVEL_DEBUG) std::fputs(text, stderr); }, nullptr);
     Args a;
@@ -250,8 +348,8 @@ int main(int argc, char ** argv) {
     if (!a.build_mirror.empty()) {   // the second-drive blob mirror (STRATA_BLOB_MIRROR): coldest experts first
         std::string err;
         if (a.mirror_gib < 0) {   // --check-mirror F: open it with every blob compared against the model file
-            setenv("STRATA_BLOB_MIRROR", a.build_mirror.c_str(), 1);
-            setenv("STRATA_BLOB_MIRROR_CHECK", "0", 1);
+            dio::setenv("STRATA_BLOB_MIRROR", a.build_mirror.c_str(), 1);
+            dio::setenv("STRATA_BLOB_MIRROR_CHECK", "0", 1);
             Ds41FileBlobs chk(a.model);
             if (!chk.open(err)) { std::fprintf(stderr, "ds41_generate: experts: %s\n", err.c_str()); return 1; }
             return chk.mirrored() > 0 ? 0 : 1;
@@ -262,7 +360,7 @@ int main(int argc, char ** argv) {
         std::vector<std::pair<int32_t, int32_t>> order = ds41_read_ranked(a.rank, err);
         if (order.empty()) { std::fprintf(stderr, "ds41_generate: --rank: %s\n", err.c_str()); return 1; }
         std::reverse(order.begin(), order.end());
-        if (!src.build_mirror(a.build_mirror, order, (uint64_t) (a.mirror_gib * 1073741824.0), err)) {
+        if (!src.build_mirror(a.build_mirror, order, (uint64_t) (a.mirror_gib * 1073741824.0), err, a.mirror_keep_gib)) {
             std::fprintf(stderr, "ds41_generate: build-mirror: %s\n", err.c_str());
             return 1;
         }
@@ -324,7 +422,9 @@ int main(int argc, char ** argv) {
     Ds41Dense dense;
     std::string err;
     const double t_load = now_ms();
+    heap_check("start");
     if (!dense.init(a.model, dc, err)) { std::fprintf(stderr, "ds41_generate: dense init: %s\n", err.c_str()); return 1; }
+    heap_check("dense init");
     const Ds41Geometry & G = dense.geom();
     const int n_layer = (int) dense.n_layer(), n_embd = (int) G.n_embd, top_k = (int) G.n_used, nv = (int) G.vocab;
     // enc-skip's layer 20: the LAST kv source (every compressed-KV / index-key write is owned by a kv source, and the
@@ -353,6 +453,38 @@ int main(int argc, char ** argv) {
         slot_gib = std::max(0.0, ((double) fr - a.vram_margin_gib * 1073741824.0) / 1073741824.0);
         std::fprintf(stderr, "VRAM: %.2f GiB free after the dense half -> %.2f GiB of expert slots (margin %.2f)\n",
                      fr / 1073741824.0, slot_gib, a.vram_margin_gib);
+    }
+    // --gpu2: the second card's worker seeds its VRAM with the head of --rank while this process goes on; the tier
+    // below leaves those experts out of this card's cache and arena and sends their rows there (ds41_gpu2.hpp)
+    Ds41Gpu2 gpu2;
+    bool gpu2_on = false;
+    if (a.gpu2 >= 0) {
+        if (a.experts == "cpu" || ggml_backend_is_cpu(be)) {
+            std::fprintf(stderr, "ds41_generate: --gpu2 needs the GPU tier\n");
+            return 2;
+        }
+        Ds41Gpu2Config gc;
+        gc.model = a.model;
+        gc.rank = a.rank;
+        gc.gpu = a.gpu2;
+        gc.reserve_gib = a.gpu2_reserve;
+        gc.max_gib = a.gpu2_gib;
+        // auto: the main card's decode cache keeps the ranking's head (its slot budget), the second card takes what follows
+        gc.skip_gib = a.gpu2_skip >= 0 ? a.gpu2_skip : slot_gib;
+        gc.max_rows = std::max({ PB, a.prefill_chunk, Ds41MoeTier::kMaxMulti, 1 });
+        gc.piece = a.gpu2_piece;
+        gc.chunk_mmq = a.chunk_mmq;
+        gc.n_layers = TG.n_layers;
+        gc.n_experts = TG.n_experts;
+        gc.top_k = TG.top_k;
+        gc.n_embd = TG.n_embd;
+        const double tg = now_ms();
+        if (!gpu2.start(gc, err) || !gpu2.wait_ready(err)) {   // a missing / unusable second card: one card, as without it
+            std::fprintf(stderr, "ds41_generate: %s - running on one card\n", err.c_str());
+        } else {
+            gpu2_on = true;
+            std::fprintf(stderr, "gpu2: card %d - %s (ready after %.1f s)\n", a.gpu2, gpu2.report().c_str(), (now_ms() - tg) / 1000.0);
+        }
     }
     Ds41MoeTier tier;
     Ds41MoeConfig mc;
@@ -392,7 +524,13 @@ int main(int argc, char ** argv) {
                      a.prune_penalty > 0 ? ("penalised -" + std::to_string(a.prune_penalty)).c_str() : "masked out of routing", a.prune.c_str());
         mc.exclude = pruned;
     }
+    if (gpu2_on) {   // the second card's experts: no slot and no arena space here (pruned ones stay pruned)
+        if (mc.exclude.empty()) mc.exclude.assign((size_t) (TG.n_layers * TG.n_experts), 0);
+        for (size_t i = 0; i < mc.exclude.size(); ++i) mc.exclude[i] = (char) (mc.exclude[i] || gpu2.owned()[i]);
+    }
     if (!tier.init(TG, &src, mc, err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }
+    if (gpu2_on && !tier.set_remote(&gpu2, err)) { std::fprintf(stderr, "ds41_generate: %s\n", err.c_str()); return 1; }
+    heap_check("tier init");
     dense.set_oom_hook([&]() { return tier.release_prestage(); });   // a prompt pass that does not fit: prestage gives way
     // defer the VRAM cache: the prompt's chunk + graph buffers (~4 GiB) use that VRAM first, then the cache opens into
     // it (measured) - the old fixed --vram-margin had to cover prefill and starved decode of slots.  --serve does this
@@ -427,8 +565,8 @@ int main(int argc, char ** argv) {
             if (!r) { r = 1; ++got; }
         }
     }
-    auto resident_now = [&](int64_t l, int64_t e) {
-        return proxy_res.empty() ? tier.resident(l, e) : proxy_res[(size_t) (l * TG.n_experts + e)] != 0;
+    auto resident_now = [&](int64_t l, int64_t e) {   // --gpu2: the second card's experts are VRAM-resident too
+        return proxy_res.empty() ? (tier.resident(l, e) || gpu2.owns(l, e)) : proxy_res[(size_t) (l * TG.n_experts + e)] != 0;
     };
     // bias_now: route-bias / file penalty are DECODE levers - before the VRAM seed (the prompt) only the prune part
     // applies, unless --bias-prompt measures them (the prompt's file tier is prefetched; a penalty there buys nothing)
@@ -771,6 +909,9 @@ int main(int argc, char ** argv) {
             sc.main_gguf = a.model;
             sc.max_append = 16;
             if (!std::getenv("STRATA_DSPARK_OWN_HEAD")) sc.shared_head = dense.weight("output.weight");   // -0.7 GB
+#if defined(_WIN32)
+            sc.token_embd = dense.token_embd();   // the trunk's mapping is then released after load (Ds41Dense::token_embd)
+#endif
             dsp = std::make_unique<Ds41DSpark>();
             const double ti = now_ms();
             if (!dsp->init(sc, err)) { err = "DSpark init: " + err; return false; }
@@ -805,6 +946,8 @@ int main(int argc, char ** argv) {
             } else return false;
         }
         seed_s = (now_ms() - ts) / 1000.0;
+        if (gpu2_on)
+            std::fprintf(stderr, "serve: VRAM cache %.2f GiB (%.2f free), %lld experts\n", seed_gib, seed_free, (long long) tier.resident());
         proxy_res.clear();   // the real VRAM set from here on
         bias_now = true;     // decode: route bias + file penalty on
         apply_bias();
@@ -912,6 +1055,7 @@ int main(int argc, char ** argv) {
                     // GPU: the tier writes the routed sums straight into the dense half's routed tensor (no 2 x n*D*4
                     // host round trip per layer); CPU / STRATA_ROUTED_HOST=1: through the host as before
                     float * rdev = routed_host ? nullptr : dense.routed_dev();
+                    heap_check("pre-tier");
                     if (l < 2) vram_log("pre-tier", l);
                     for (int s = d0; s < B; s += piece) {   // the experts for the dense rows (in pieces if the buffers cap)
                         const int pn = std::min(piece, B - s);
@@ -1100,6 +1244,14 @@ int main(int argc, char ** argv) {
             if (line == "QUIT") break;
             if (line == "STOP" || line.empty()) continue;
             if (line.rfind("GEN ", 0) != 0) { std::printf("ERR unsupported command\n"); std::fflush(stdout); continue; }
+            if (gpu2_on && !gpu2.ok()) {   // the second card's worker failed in an earlier request: a fresh one (~5 s)
+                std::string e2;
+                const double tr = now_ms();
+                if (gpu2.restart(e2))
+                    std::fprintf(stderr, "gpu2: worker restarted in %.1f s - %s\n", (now_ms() - tr) / 1000.0, gpu2.report().c_str());
+                else
+                    std::fprintf(stderr, "gpu2: restart failed (%s) - one card for this request\n", e2.c_str());
+            }
             std::istringstream ss(line);
             std::string w, csv;
             int max_new = 0, tk = 0;
@@ -1483,9 +1635,10 @@ int main(int argc, char ** argv) {
             }
             const Ds41MoeStats pst = tier.stats();
             std::fprintf(stderr, "serve: prompt %d tokens (%d reused, %s) in %.2f s = %.1f tok/s (experts %lld hit / %lld cpu / "
-                                 "%lld pcie / %lld file)\n", total, reused, by_step ? (exact_pass ? "exact passes" : "passes") : "batch", prompt_ms / 1000.0,
+                                 "%lld pcie / %lld file)%s\n", total, reused, by_step ? (exact_pass ? "exact passes" : "passes") : "batch", prompt_ms / 1000.0,
                          1000.0 * (total - reused) / std::max(prompt_ms, 1e-9), (long long) pst.hits, (long long) pst.cpu,
-                         (long long) pst.pcie, (long long) pst.file_tier);
+                         (long long) pst.pcie, (long long) pst.file_tier,
+                         gpu2_on ? (" + " + std::to_string(pst.remote) + " on gpu2").c_str() : "");
             if (defer_vram && !cache_open) {   // decode next: the VRAM cache opens into what the prompt freed
                 if (!open_cache()) {
                     std::printf("ERR VRAM seed failed: %s\n", err.c_str());
@@ -1642,9 +1795,16 @@ int main(int argc, char ** argv) {
                 snap_len = -1;
                 finish = "length";
             }
-            std::fprintf(stderr, "serve: %d tokens in %.2f s = %.2f tok/s (%s); experts: %lld hit, %lld cpu, %lld pcie, %lld file\n",
+            std::fprintf(stderr, "serve: %d tokens in %.2f s = %.2f tok/s (%s); experts: %lld hit, %lld cpu, %lld pcie, %lld file%s\n",
                          gen, dec_ms / 1000.0, 1000.0 * std::max(0, gen - 1) / std::max(dec_ms, 1e-9), finish,
-                         (long long) st.hits, (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier);
+                         (long long) st.hits, (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier,
+                         gpu2_on ? (", " + std::to_string(st.remote) + " gpu2").c_str() : "");
+            if (gpu2_on)
+                std::fprintf(stderr, "serve: gpu2 so far: %lld calls, %lld rows; waited %.0f ms after this card's own work, "
+                             "worker busy %.0f ms (decode/verify %lld calls %.0f / %.0f ms, prompt %lld calls %.0f / %.0f ms)%s\n",
+                             (long long) gpu2.calls, (long long) gpu2.rows, gpu2.wait_ms, gpu2.worker_ms,
+                             (long long) gpu2.calls_k[0], gpu2.wait_k[0], gpu2.worker_k[0],
+                             (long long) gpu2.calls_k[1], gpu2.wait_k[1], gpu2.worker_k[1], gpu2.ok() ? "" : " - DOWN");
 #if defined(DS41_HAVE_DSPARK)
             if (rq_pass > 0)
                 std::fprintf(stderr, "serve: DSpark %ld passes, %.2f tokens/pass (all requests %.2f)\n", rq_pass,
@@ -1900,6 +2060,10 @@ int main(int argc, char ** argv) {
                  100.0 * st.hits / std::max<int64_t>(1, st.lookups()), st.cpu_ms, st.file_ms,
                  (long long) st.spec_issued, (long long) st.spec_hits, (long long) st.prefetch_issued,
                  (long long) st.prefetch_dummy, (long long) st.prefetched_useful);
+    if (gpu2_on)
+        std::fprintf(stderr, "gpu2: %lld calls, %lld rows, %lld expert entries (%lld this decode); waited %.0f ms for it after "
+                     "this card's own work, worker busy %.0f ms%s\n", (long long) gpu2.calls, (long long) gpu2.rows,
+                     (long long) gpu2.entries, (long long) st.remote, gpu2.wait_ms, gpu2.worker_ms, gpu2.ok() ? "" : " - DOWN");
     if (spec)
         std::fprintf(stderr, "DSpark: %ld verify passes, %.3f accepted drafts/pass = %.3f tokens/pass, %.1f%% full, %ld re-fed; "
                      "verify %.1f ms/pass, draft %.2f ms/pass (depth %d)\n", sp_pass, (double) sp_acc / std::max(1L, sp_pass),
