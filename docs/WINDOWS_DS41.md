@@ -573,6 +573,19 @@ Exactness (`STRATA_SERVE_DUMP`, the last prompt row's logits for turn 2): rewoun
 repeatable from run to run here, and the rewind falls inside that spread. All three runs pick the same top token
 (p = 0.99).
 
+### Chats with images
+
+A prompt with an image did no reuse at all. The engine cleared its state and took no snapshot for every image
+request, because each image is the same run of `image_token` ids, and comparing tokens alone would "continue" a
+different picture. An agent chat with 4 screenshots in its first message therefore re-read 11.9K -> 19.9K tokens on
+every step, with 0 reused. Now each image position is compared by a hash of its embedding row (the server caches
+encoded images by the image's hash, so the same picture gives the same bytes). The same image matches, and a
+different one ends the match where it starts. Image prompts are snapshotted like text ones.
+
+Measured (a 14K-token prompt with 2 images in the first user message, 4 greedy turns): prompt read 28.3 s, then
+2.5 / 3.0 / 0.9 s with 14,009 / 14,081 / 14,178 tokens reused. The same prompt with the two images swapped matched
+only up to the first image (lcp 13,241) and was read again.
+
 ## Debugging options
 
 - `-DSTRATA_DS41_DEBUGINFO=ON`: `/Z7` + a PDB, so the crash handler's stack has function names and lines.

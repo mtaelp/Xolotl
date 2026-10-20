@@ -1318,16 +1318,10 @@ int main(int argc, char ** argv) {
         const int cfg_rprot = env_rank("STRATA_RB_PROTECT"), cfg_rpool = env_rank("STRATA_RB_POOL");
         int cur_rprot = cfg_rprot, cur_rpool = cfg_rpool;
         std::string line;
-        bool previous_vision = false;
         while (next_line(line)) {
             if (line == "QUIT") break;
             if (line == "STOP" || line.empty()) continue;
             dense.clear_vision();
-            if (previous_vision) {
-                hist.clear();
-                snap_len = -1;
-                previous_vision = false;
-            }
             // GENI = GEN with an image-embedding file: GENI <max_new> [k=v ..] <embeddings file> <ids csv> (the file
             // holds one strata-vision record per image, in prompt order; the engine lands them on the image_token runs).
             const bool geni = line.rfind("GENI ", 0) == 0;
@@ -1402,25 +1396,33 @@ int main(int argc, char ** argv) {
                     std::printf("ERR %s\n", verr.c_str()); std::fflush(stdout); continue;
                 }
                 if (vis_rows.empty()) { std::printf("ERR GENI prompt has no image tokens\n"); std::fflush(stdout); continue; }
-                // an image prompt prefills fresh: every image span is the same run of image_token, so a token-only reuse
-                // test would "continue" a different image (same ids, different embeddings).  Empty hist / no snapshot / no park.
-                dense.drop_park();
-                park_hist.clear();
-                hist.clear();
-                snap_len = -1;
                 dense.set_vision(vis_rows.data(), vis_pos.data(), (int) vis_pos.size());
-                previous_vision = true;
             } else {
                 dense.clear_vision();
             }
+            // the reuse test's view of the prompt: every image span is the same run of image_token, so a token-only test
+            // would "continue" a different image (same ids, different embeddings).  Each image position is keyed by a
+            // hash of its embedding row instead (negative: never a token id), so the same image matches and another one
+            // ends the match there.  It used to clear the whole state for any image prompt, and an agent conversation
+            // with a screenshot re-read its whole prompt every step (11.9K -> 19.9K tokens, 0 reused, 2026-10-21).
+            std::vector<int> keys = ids;
+            {
+                const int64_t ne = dense.geom().n_embd;
+                for (size_t v = 0; v < vis_pos.size(); ++v) {
+                    uint64_t h = 1469598103934665603ull;   // FNV-1a over the row's bytes
+                    const auto * b = reinterpret_cast<const uint8_t *>(vis_rows.data() + v * (size_t) ne);
+                    for (size_t i = 0; i < (size_t) ne * 4; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+                    keys[(size_t) vis_pos[v]] = -1 - (int) (h & 0x3fffffff);
+                }
+            }
             size_t lcp = 0;
-            while (lcp < hist.size() && lcp < ids.size() && hist[lcp] == ids[lcp]) ++lcp;
+            while (lcp < hist.size() && lcp < keys.size() && hist[lcp] == keys[lcp]) ++lcp;
             bool unparked = false;
             int reuse_override = -1;   // a partial unpark: resume at the longest common prefix (see below)
             size_t lp_show = 0;        // how far this request actually continues the PARKED conversation (logged)
             if (dense.parked()) {   // does this request continue the parked conversation (better than the live one)?
                 size_t lp = 0;
-                while (lp < park_hist.size() && lp < ids.size() && park_hist[lp] == ids[lp]) ++lp;
+                while (lp < park_hist.size() && lp < ids.size() && park_hist[lp] == keys[lp]) ++lp;
                 lp_show = lp;
                 // STRATA_SERVE_PARK_PARTIAL (default on): a request that continues MOST of the parked conversation is
                 // worth restoring, not only one that continues ALL of it.  A chat template that re-renders its tail -
@@ -1759,9 +1761,10 @@ int main(int argc, char ** argv) {
                 snap_len = -1;
                 continue;
             }
-            hist = ids;
-            // no snapshot for an image prompt: a text request with the same ids (all image_token) would restore its embeddings
-            if (total > reused && !is_vision && dense.snapshot(total)) {
+            hist = keys;   // image positions as their row hashes (see keys)
+            // an image prompt is snapshotted too: hist holds its image positions as row hashes, so a text request with the
+            // same ids (all image_token) does not match them
+            if (total > reused && dense.snapshot(total)) {
                 snap_len = total;
                 snap_logits = last_logits;
                 snap_seed.swap(cur_seed);   // this prompt's DSpark tail rows (0 rows when DSpark is off / no tail ran)
