@@ -579,3 +579,27 @@ repeatable from run to run here, and the rewind falls inside that spread. All th
 - `-DSTRATA_DS41_ASAN=ON`: AddressSanitizer on the engine and the Strata libraries it links. Run it with the
   `clang_rt.asan_dynamic-x86_64.dll` folder from Visual Studio on `PATH`.
 - `DS41_HEAP_CHECK=1`: validates every process heap at the load checkpoints and before each layer's expert tier.
+
+## Image input (vision) on Windows (2026-10-21)
+
+`strata-ds41-windows.json` now runs with `--vision` and a CPU image encoder (upstream #8, `docs/ds4/V41_VISION.md`):
+
+- Encoder: `tools/v41/vision/ds41_vision.py` in its own venv (`H:/ai/xolot/venv-vision`, PyTorch 2.14.1+cpu, NumPy,
+  Pillow), f32, 8 threads. It reads the vision/aligner weights from the DSpark sidecar `V41-MTP-Vision-1017.Q2_K.gguf`
+  (the 1017 GGUF already carries every layer's `exp_probs_b_vl.bias`), and DeepSeek's `vision.py` /
+  `image_processor.py` from the 1017 repo's `inference/` folder (`H:/ai/xolot/dsv41-inference/inference`).
+- Windows fix: the sidecar reader used `os.pread`, which Python has no Windows version of; it now seeks and reads.
+- `--dtype bf16` fails in the upstream script (modules stay f32), so it stays on f32.
+- pip behind Avast's HTTPS scanning: `PIP_CERT="C:/ProgramData/Avast Software/Avast/wscert.pem"`.
+
+Measured on this PC (RTX 5090 + 3090, 7800X3D):
+
+| Check | Result |
+| --- | --- |
+| Encoder alone, DeepSeek's `carrots.jpeg` (444 image tokens) | 12.1-12.5 s per image, about 2 GB RAM |
+| `check_api.py` (red square / blue circle / both / text after) | PASS, 0.9-9.7 s per request |
+| `carrots.jpeg` with "describe in two sentences" | correct description, 24.0 s end to end |
+| Text chat after that, 9,317-token prompt, then a follow-up | turn 2 reused 9,316 tokens, prompt read 23.4 s -> 2.0 s |
+
+Limits (upstream's): an image request prefills its whole prompt and the next request starts fresh, so an image in a
+long chat costs a full prompt read. The encoder uses the CPU only, and no VRAM.

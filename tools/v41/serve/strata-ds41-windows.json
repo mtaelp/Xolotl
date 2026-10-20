@@ -28,7 +28,8 @@
     "--vram-margin",
     "1.5",
     "--gpu2",
-    "1"
+    "1",
+    "--vision"
   ],
   "env": {
     "GGML_NO_BACKTRACE": "1",
@@ -52,6 +53,15 @@
   ],
   "cwd": ".",
   "tokenizer": "H:/ai/xolot/models/1017/tokenizer",
+  "vision": {
+    "exe": "tools/v41/vision/ds41_vision.py",
+    "python": "H:/ai/xolot/venv-vision/Scripts/python.exe",
+    "mmproj": "H:/ai/xolot/models/1017/V41-MTP-Vision-1017.Q2_K.gguf",
+    "model": "H:/ai/xolot/models/1017/V41-GSQ-1017.gguf",
+    "reference_dir": "H:/ai/xolot/dsv41-inference/inference",
+    "threads": 8,
+    "gpu": false
+  },
   "model_name": "deepseek-v4.1-flash-strata-gsq",
   "log": "logs/strata-ds41.log",
   "port": 8150,

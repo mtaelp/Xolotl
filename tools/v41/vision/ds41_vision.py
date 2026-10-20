@@ -142,7 +142,7 @@ class SidecarWeights:
         self.tensors = {n: (s, t, o) for n, s, t, o in tensors if n.startswith(VISION_PREFIXES)}
         if not self.tensors:
             raise ValueError(f"{path}: no vision.* / aligner.* / image_* tensors")
-        self.fd = os.open(path, os.O_RDONLY)
+        self.f = open(path, "rb")              # binary file object: Windows has no os.pread
 
     def names(self):
         return sorted(self.tensors)
@@ -154,7 +154,8 @@ class SidecarWeights:
         nbytes = ggml_nbytes(shape, ty)
         raw = bytearray()
         while len(raw) < nbytes:
-            b = os.pread(self.fd, nbytes - len(raw), self.data_start + off + len(raw))
+            self.f.seek(self.data_start + off + len(raw))
+            b = self.f.read(nbytes - len(raw))
             if not b:
                 raise OSError(f"{name}: short read")
             raw += b
