@@ -1471,6 +1471,13 @@ int main(int argc, char ** argv) {
             } else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len < ids.size() && dense.restore()) {
                 hist.resize((size_t) snap_len);
                 reused = snap_len;
+            } else if (snap_len > 0 && lcp > 0 && lcp < (size_t) snap_len && lcp < ids.size() && dense.restore_to((int) lcp)) {
+                // the next turn of a thinking chat: DeepSeek's template re-renders the previous prompt's last token
+                // ("<think>" -> "</think>" + the answer), so lcp = snapshot - 1.  Requiring lcp >= snapshot re-read the
+                // whole prompt every turn (113,191 of 113,192 matched -> reused=0, 152 s).  Rewind a few tokens instead.
+                std::fprintf(stderr, "serve: rewound the %d-token snapshot to lcp %zu\n", snap_len, lcp);
+                hist.resize(lcp);
+                reused = (int) lcp;
             } else {
                 // an unrelated request: park the conversation it would overwrite (see STRATA_SERVE_PARK)
                 const int64_t rows = (int64_t) ids.size() + (max_new > 0 ? max_new : park_max) + 64;

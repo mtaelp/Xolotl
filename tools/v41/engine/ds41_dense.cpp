@@ -1919,6 +1919,14 @@ bool Ds41Dense::restore() {
     return true;
 }
 
+bool Ds41Dense::restore_to(int pos) {
+    Impl & im = *p_;
+    const int64_t back = (int64_t) im.snap_pos - pos;
+    if (im.snap_pos < 0 || pos < 1 || back < 0 || back > im.RAW - im.SWA) return false;
+    if (pos % 2 == 1 && back > 1) return false;   // the ratio-2 group (pos - 1, pos) needs pos - 1's state
+    return restore();
+}
+
 int Ds41Dense::snapshot_pos() const { return p_->snap_pos; }
 
 bool Ds41Dense::park(int64_t positions) {

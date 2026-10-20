@@ -170,6 +170,12 @@ public:
     /// one line for STRATA_VRAM_TRACE.
     std::string vram_ledger() const;
     bool restore();
+    /// restore(), then continue at pos <= snapshot_pos() (the positions [pos, snapshot) are re-fed and overwrite theirs).
+    /// Exact while the snapshot's rings still hold what a re-feed from pos reads: the window ring keeps RAW = SWA + 16
+    /// positions (so up to 16 back), the ratio-2 state ring the last 2 (an odd pos needs pos - 1: 1 back).  False
+    /// (nothing restored) past that.  Serve: DeepSeek's template ends a prompt with "<｜Assistant｜><think>" and
+    /// renders that turn as "<｜Assistant｜></think>..." in the next one, so a follow-up matches all but its last token.
+    bool restore_to(int pos);
     int snapshot_pos() const;
     /// Serve: keep a conversation through an UNRELATED request.  An unrelated request writes its own positions from 0, so
     /// it overwrites the start of every position-indexed cache (compressed KV, indexer keys) and the snapshot rings.

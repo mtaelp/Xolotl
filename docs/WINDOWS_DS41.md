@@ -544,6 +544,35 @@ was compared with the model file after the build. The engine reads 10.4-11.5 GB/
 512K context filled, a mirror on a drive that shares the chipset link with the model, and whether the pagefile on
 `C:` gets busy enough under memory pressure to slow the mirror (paging was not recorded).
 
+## Chat turns re-read the whole prompt (fixed 2026-10-21)
+
+Every follow-up turn of a thinking chat logged `reuse lcp=113191 ... snap=-1 prompt=115268 -> reused=0`. The
+Monitor showed `REUSED 0`, and each turn spent about 150-175 s reading 113-115K tokens again. Cause: DeepSeek's encoder
+ends a prompt with `<｜Assistant｜><think>`, and the next prompt renders that same turn as
+`<｜Assistant｜></think>answer<｜end▁of▁sentence｜>` (past reasoning is dropped, as the model's template says). So the
+new prompt matches all of the snapshot except its last token. The engine only resumed at `lcp >= snapshot`, so it
+read everything again. The rendering is the model's own and stays as it is.
+
+Fix: `Ds41Dense::restore_to(pos)` restores the prompt-end snapshot and continues a few tokens below it. This is exact
+because every cache is indexed by position except the window ring and the ratio-2 compressor state. The window ring
+holds `RAW = SWA + 16` positions, so it can go up to 16 tokens back. The ratio-2 ring holds the last 2 states, so an
+odd `pos` can go back only 1. The log says `serve: rewound the N-token snapshot to lcp M`.
+
+Measured (3 greedy turns over a 28.4K-token document, `--gpu2 1`, fast routing):
+
+| turn | prompt | reused | prompt read |
+|---|---:|---:|---:|
+| 1 | 28,429 | 0 | 46.1 s |
+| 2 | 28,573 | 28,428 | 4.4 s |
+| 3 | 28,714 | 28,572 | 4.5 s |
+| 1 (111.7K document, temperature 1) | 111,676 | 0 | 158.4 s |
+| 2 | 111,806 | 111,675 | 4.5 s |
+
+Exactness (`STRATA_SERVE_DUMP`, the last prompt row's logits for turn 2): rewound vs cold, mean |diff| 0.35 and KL
+8e-4. Two cold reads of the same prompt differ by mean |diff| 0.47 and KL 3e-4. The engine is not bitwise
+repeatable from run to run here, and the rewind falls inside that spread. All three runs pick the same top token
+(p = 0.99).
+
 ## Debugging options
 
 - `-DSTRATA_DS41_DEBUGINFO=ON`: `/Z7` + a PDB, so the crash handler's stack has function names and lines.
