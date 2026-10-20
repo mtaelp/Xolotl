@@ -2,18 +2,20 @@
 #include "ds41_engram.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <random>
-#include <cstdlib>
-#include <cstring>
-#include "ds41_io.hpp"
-#if !defined(_WIN32)
+#ifndef _WIN32
 #include <linux/fiemap.h>
 #include <linux/fs.h>
 #include <sys/ioctl.h>
 #include <sys/sysmacros.h>
 #endif
+#include <cstdlib>
+#include <cstring>
+#include "ds41_sys.hpp"
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 
@@ -29,7 +31,7 @@ std::string slurp(const std::string & p) {
     return ss.str();
 }
 
-bool exists(const std::string & p) { return dio::exists(p); }
+bool exists(const std::string & p) { std::error_code ec; return std::filesystem::exists(p, ec); }
 
 // "key": "value" in a JSON text (the HF index's weight_map; names are unique)
 std::string json_str(const std::string & js, const std::string & key) {
@@ -43,16 +45,16 @@ std::string json_str(const std::string & js, const std::string & key) {
 
 // a safetensors tensor's absolute byte offset (8 + header length + data_offsets[0]) and its byte size
 bool st_tensor(const std::string & path, const std::string & name, uint64_t & off, uint64_t & bytes, std::string & dtype) {
-    const int fd = dio::open(path.c_str(), O_RDONLY);
+    const int fd = ds41_sys::open(path.c_str(), O_RDONLY);
     if (fd < 0) return false;
     uint64_t hl = 0;
-    bool ok = dio::pread(fd, &hl, 8, 0) == 8 && hl < (1ull << 30);
+    bool ok = ds41_sys::pread(fd, &hl, 8, 0) == 8 && hl < (1ull << 30);
     std::string h;
     if (ok) {
         h.resize(hl);
-        ok = dio::pread(fd, h.data(), hl, 8) == (ssize_t) hl;
+        ok = ds41_sys::pread(fd, h.data(), hl, 8) == (ssize_t) hl;
     }
-    dio::close(fd);
+    ds41_sys::close(fd);
     if (!ok) return false;
     const size_t p = h.find("\"" + name + "\"");
     if (p == std::string::npos) return false;
@@ -92,7 +94,7 @@ float fp8_e4m3(uint8_t b) {
 struct Ds41Engram::RawMap {
     int dev = -1;
     std::vector<uint64_t> log, phys, len;
-    ~RawMap() { if (dev >= 0) dio::close(dev); }
+    ~RawMap() { if (dev >= 0) ds41_sys::close(dev); }
     ssize_t read(void * buf, size_t n, uint64_t off) const {
         size_t done = 0;
         while (done < n) {
@@ -102,7 +104,7 @@ struct Ds41Engram::RawMap {
             const size_t i = (size_t) (it - log.begin()) - 1;
             if (o >= log[i] + len[i]) return -1;
             const size_t k = (size_t) std::min<uint64_t>(n - done, log[i] + len[i] - o);
-            const ssize_t r = dio::pread(dev, (uint8_t *) buf + done, k, (int64_t) (phys[i] + (o - log[i])));
+            const ssize_t r = ds41_sys::pread(dev, (uint8_t *) buf + done, k, (int64_t) (phys[i] + (o - log[i])));
             if (r <= 0) return -1;
             done += (size_t) r;
         }
@@ -111,8 +113,11 @@ struct Ds41Engram::RawMap {
 };
 
 static std::shared_ptr<Ds41Engram::RawMap> raw_map(const std::string & path, int fd) {
-#if defined(_WIN32)
-    (void) path; (void) fd;
+#ifdef _WIN32
+    // FIEMAP + reading the partition's block device is Linux-only; Windows reads the table through NTFS, whose
+    // random reads into a fragmented file are not the ntfs3 problem this works around.
+    (void) path;
+    (void) fd;
     return nullptr;
 #else
     const char * env = std::getenv("STRATA_ENGRAM_RAWDEV");
@@ -143,15 +148,15 @@ static std::shared_ptr<Ds41Engram::RawMap> raw_map(const std::string & path, int
     }
     const bool force = env && env[0] == '1';
     if (m->log.empty() || (!force && m->log.size() < 1024)) return nullptr;
-    dio::Stat st;
-    if (dio::fstat(fd, &st) != 0) return nullptr;
+    ds41_sys::Stat st;
+    if (ds41_sys::fstat(fd, &st) != 0) return nullptr;
     char sys[96];
     std::snprintf(sys, sizeof sys, "/sys/dev/block/%u:%u/uevent", major(st.st_dev), minor(st.st_dev));
     std::ifstream ue(sys);
     std::string line, devname;
     while (std::getline(ue, line)) if (line.rfind("DEVNAME=", 0) == 0) devname = line.substr(8);
     if (devname.empty()) return nullptr;
-    m->dev = dio::open(("/dev/" + devname).c_str(), O_RDONLY | O_CLOEXEC);
+    m->dev = ds41_sys::open(("/dev/" + devname).c_str(), O_RDONLY | O_CLOEXEC);
     if (m->dev < 0) { std::fprintf(stderr, "engram: %s: %zu extents, /dev/%s not readable - filesystem reads\n",
                                    path.c_str(), m->log.size(), devname.c_str()); return nullptr; }
     std::mt19937_64 rng(7);
@@ -159,7 +164,7 @@ static std::shared_ptr<Ds41Engram::RawMap> raw_map(const std::string & path, int
     const uint64_t size = (uint64_t) st.st_size;
     for (int k = 0; k < 256; ++k) {
         const uint64_t o = (rng() % (size > 4096 ? size - 4096 : 1)) & ~(uint64_t) 255;
-        if (dio::pread(fd, a, sizeof a, (int64_t) o) != (ssize_t) sizeof a || m->read(b, sizeof b, o) != (ssize_t) sizeof b ||
+        if (ds41_sys::pread(fd, a, sizeof a, (int64_t) o) != (ssize_t) sizeof a || m->read(b, sizeof b, o) != (ssize_t) sizeof b ||
             std::memcmp(a, b, sizeof a) != 0) {
             std::fprintf(stderr, "engram: %s: raw device check FAILED at %llu - filesystem reads\n", path.c_str(),
                          (unsigned long long) o);
@@ -173,7 +178,7 @@ static std::shared_ptr<Ds41Engram::RawMap> raw_map(const std::string & path, int
 }
 
 static inline ssize_t tread(int fd, const std::shared_ptr<Ds41Engram::RawMap> & m, void * buf, size_t n, uint64_t off) {
-    return m ? m->read(buf, n, off) : dio::pread(fd, buf, n, (int64_t) off);
+    return m ? m->read(buf, n, off) : ds41_sys::pread(fd, buf, n, (int64_t) off);
 }
 
 Ds41Engram::~Ds41Engram() {
@@ -184,12 +189,12 @@ Ds41Engram::~Ds41Engram() {
     cv_.notify_all();
     for (auto & t : workers_) t.join();
     for (auto & t : tables_) {
-        if (t.fd_w >= 0) dio::close(t.fd_w);
-        if (t.fd_s >= 0) dio::close(t.fd_s);
+        if (t.fd_w >= 0) ds41_sys::close(t.fd_w);
+        if (t.fd_s >= 0) ds41_sys::close(t.fd_s);
     }
 }
 
-bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & dirs, int threads, std::string & err) {
+void Ds41Engram::setup_hash(const Ds41Geometry & g) {
     g_ = &g;
     cols_ = (g.engram_ngram - 1) * g.engram_heads;
     dim_ = g.engram_dim;
@@ -202,6 +207,93 @@ bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & d
             acc += g.engram_primes[(size_t) (e * cols_ + c)];
         }
     }
+}
+
+uint64_t Ds41Engram::geometry_fingerprint() const {
+    uint64_t h = 0xcbf29ce484222325ull;   // FNV-1a over everything the hash and the row layout depend on
+    auto mix = [&](const void * p, size_t n) {
+        const uint8_t * b = (const uint8_t *) p;
+        for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 0x100000001b3ull; }
+    };
+    const Ds41Geometry & g = *g_;
+    const int64_t hdr[4] = { g.engram_heads, g.engram_dim, g.engram_ngram, g.engram_pad };
+    mix(hdr, sizeof hdr);
+    mix(g.engram_layers.data(), g.engram_layers.size() * sizeof(g.engram_layers[0]));
+    mix(g.engram_rows.data(), g.engram_rows.size() * sizeof(g.engram_rows[0]));
+    mix(g.engram_primes.data(), g.engram_primes.size() * sizeof(g.engram_primes[0]));
+    mix(g.engram_mult.data(), g.engram_mult.size() * sizeof(g.engram_mult[0]));
+    mix(g.engram_token_map.data(), g.engram_token_map.size() * sizeof(g.engram_token_map[0]));
+    return h;
+}
+
+bool Ds41Engram::read_raw(int e, uint32_t row, uint8_t * dst) const {
+    if (e < 0 || e >= (int) tables_.size()) return false;
+    const Table & T = tables_[(size_t) e];
+    if ((int64_t) row >= T.rows) return false;
+    const uint64_t srsz = (uint64_t) dim_ / 32;
+    return tread(T.fd_w, T.rm_w, dst, (size_t) dim_, T.off_w + (uint64_t) row * (uint64_t) dim_) == (ssize_t) dim_ &&
+           tread(T.fd_s, T.rm_s, dst + dim_, (size_t) srsz, T.off_s + (uint64_t) row * srsz) == (ssize_t) srsz;
+}
+
+// Hot-set pack (written by ds41_engram_hot pack):
+//   "XENGHOT1" | u32 version (1) | u32 slots | u32 dim | u32 scale bytes (dim/32) | u64 geometry fingerprint | u64 count
+//   | u64 keys[count] (sorted ascending, slot << 32 | row) | raw rows[count][dim + dim/32] in key order.
+// open() refuses a pack whose geometry fingerprint differs, and spot-checks 64 rows against the tables, so a pack built
+// from another checkpoint's Engram (e.g. V4.1 vs 1017 - same geometry, different weights) is caught and skipped.
+bool Ds41Engram::load_hot(const std::string & path, std::string & err) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const int fd = ds41_sys::open(path.c_str(), O_RDONLY);
+    if (fd < 0) { err = "cannot open"; return false; }
+    struct Hdr { char magic[8]; uint32_t version, slots, dim, srsz; uint64_t fp, count; } h {};
+    const int64_t srsz = dim_ / 32, rsz = dim_ + srsz;
+    bool ok = ds41_sys::pread(fd, &h, sizeof h, 0) == (ssize_t) sizeof h;
+    if (ok && (std::memcmp(h.magic, "XENGHOT1", 8) != 0 || h.version != 1)) { err = "not a hot-set pack"; ok = false; }
+    if (ok && (h.slots != tables_.size() || h.dim != (uint32_t) dim_ || h.srsz != (uint32_t) srsz)) { err = "shape mismatch"; ok = false; }
+    if (ok && h.fp != geometry_fingerprint()) { err = "geometry fingerprint mismatch (built for another model)"; ok = false; }
+    ds41_sys::Stat st;
+    if (ok && (ds41_sys::fstat(fd, &st) != 0 || (uint64_t) st.st_size != sizeof h + h.count * (8 + (uint64_t) rsz))) { err = "truncated"; ok = false; }
+    if (ok) {
+        ds41_sys::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+        hot_keys_.resize((size_t) h.count);
+        hot_pool_.resize((size_t) h.count * (size_t) rsz);
+        auto rd = [&](void * dst, uint64_t n, uint64_t off) {
+            for (uint64_t done = 0; done < n;) {
+                const ssize_t r = ds41_sys::pread(fd, (uint8_t *) dst + done, (size_t) std::min<uint64_t>(n - done, 1ull << 28), (int64_t) (off + done));
+                if (r <= 0) return false;
+                done += (uint64_t) r;
+            }
+            return true;
+        };
+        ok = rd(hot_keys_.data(), h.count * 8, sizeof h) && rd(hot_pool_.data(), hot_pool_.size(), sizeof h + h.count * 8);
+        if (!ok) err = "read failed";
+    }
+    ds41_sys::close(fd);
+    for (size_t i = 1; ok && i < hot_keys_.size(); ++i)
+        if (hot_keys_[i] <= hot_keys_[i - 1]) { err = "keys not sorted"; ok = false; }
+    for (size_t i = 0; ok && i < hot_keys_.size(); ++i) {
+        const uint64_t e = hot_keys_[i] >> 32;
+        if (e >= tables_.size() || (int64_t) (uint32_t) hot_keys_[i] >= tables_[(size_t) e].rows) { err = "row out of range"; ok = false; }
+    }
+    // the rows must be THIS checkpoint's: compare 64 spread entries with the tables
+    std::vector<uint8_t> buf((size_t) rsz);
+    for (int k = 0; ok && k < 64 && !hot_keys_.empty(); ++k) {
+        const size_t i = hot_keys_.size() * (size_t) k / 64;
+        if (!read_raw((int) (hot_keys_[i] >> 32), (uint32_t) hot_keys_[i], buf.data()) ||
+            std::memcmp(buf.data(), &hot_pool_[i * (size_t) rsz], (size_t) rsz) != 0) { err = "rows differ from the tables (built from another checkpoint?)"; ok = false; }
+    }
+    if (!ok) { hot_keys_.clear(); hot_keys_.shrink_to_fit(); hot_pool_.clear(); hot_pool_.shrink_to_fit(); return false; }
+    hot_begin_.assign(tables_.size() + 1, 0);
+    for (size_t e = 0; e <= tables_.size(); ++e)
+        hot_begin_[e] = (size_t) (std::lower_bound(hot_keys_.begin(), hot_keys_.end(), (uint64_t) e << 32) - hot_keys_.begin());
+    const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::fprintf(stderr, "engram: hot set %zu rows (%.2f GiB) from %s in %.1f s (64 rows verified)\n", hot_keys_.size(),
+                 (double) hot_pool_.size() / (1024.0 * 1024 * 1024), path.c_str(), dt);
+    return true;
+}
+
+bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & dirs, int threads, std::string & err) {
+    setup_hash(g);
+    const int64_t nel = (int64_t) g.engram_layers.size();
     std::string index;
     for (const auto & d : dirs) {
         index = slurp(d + "/model.safetensors.index.json");
@@ -227,9 +319,9 @@ bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & d
                 err = "engram: " + name + " has an unexpected dtype/size";
                 return false;
             }
-            const int fd = dio::open(path.c_str(), O_RDONLY);
+            const int fd = ds41_sys::open(path.c_str(), O_RDONLY);
             if (fd < 0) { err = "engram: cannot open " + path; return false; }
-            dio::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+            ds41_sys::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
             (k ? t.fd_s : t.fd_w) = fd;
             (k ? t.off_s : t.off_w) = off;
             (k ? t.rm_s : t.rm_w) = raw_map(path, fd);
@@ -247,6 +339,13 @@ bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & d
         cache_idx_.reserve(cache_cap_);
         cache_used_ = 0;
     }
+    {
+        const char * env = std::getenv("STRATA_ENGRAM_HOT");
+        const std::string hp = !hot_path_.empty() ? hot_path_ : env ? std::string(env) : std::string();
+        std::string herr;
+        if (!hp.empty() && hp != "0" && !load_hot(hp, herr))
+            std::fprintf(stderr, "engram: hot set %s SKIPPED: %s\n", hp.c_str(), herr.c_str());
+    }
     return true;
 }
 
@@ -255,10 +354,30 @@ void Ds41Engram::set_token(int64_t pos, int tid) {
     hist_[(size_t) pos] = g_->engram_token_map[(size_t) tid];
 }
 
+// An image-span position (NgramHashState.DEAD): not a real compressed id, and it blocks the look-back (below).
+static constexpr int64_t kEngramDead = -1;
+
+void Ds41Engram::set_dead(int64_t pos) {
+    if (pos >= (int64_t) hist_.size()) hist_.resize((size_t) pos + 1024, 0);
+    hist_[(size_t) pos] = kEngramDead;
+}
+
 void Ds41Engram::hash(int64_t pos, int e, int64_t * out) const {
     const int64_t N = g_->engram_ngram, H = g_->engram_heads;
     int64_t tok[8];
-    for (int64_t k = 0; k < N; ++k) tok[k] = pos - k >= 0 ? hist_[(size_t) (pos - k)] : g_->engram_pad;
+    // Look-back stops at the start of the sequence and at any DEAD token: once blocked, this and every earlier token
+    // of the n-gram is the pad id (model.py engram.py forward: blocked is cumulative over the shifts).
+    bool blocked = false;
+    for (int64_t k = 0; k < N; ++k) {
+        int64_t v = g_->engram_pad;
+        if (pos - k < 0) blocked = true;
+        else {
+            const int64_t h = hist_[(size_t) (pos - k)];
+            if (h == kEngramDead) blocked = true;
+            else if (!blocked) v = h;
+        }
+        tok[k] = v;
+    }
     const int64_t * mult = &g_->engram_mult[(size_t) (e * N)];
     int64_t rolling = tok[0] * mult[0];
     for (int64_t i = 1; i < N; ++i) {
@@ -289,8 +408,8 @@ bool Ds41Engram::rows_reference(int64_t pos0, int n, std::vector<std::vector<flo
             const Table & T = tables_[(size_t) e];
             const int64_t r = ids[(size_t) j];
             if (r < 0 || r >= T.rows ||
-                dio::pread(T.fd_w, w, (size_t) dim_, (int64_t) (T.off_w + (uint64_t) r * (uint64_t) dim_)) != (ssize_t) dim_ ||
-                dio::pread(T.fd_s, s, (size_t) (dim_ / 32), (int64_t) (T.off_s + (uint64_t) r * (uint64_t) (dim_ / 32))) != (ssize_t) (dim_ / 32)) {
+                ds41_sys::pread(T.fd_w, w, (size_t) dim_, (int64_t) (T.off_w + (uint64_t) r * (uint64_t) dim_)) != (ssize_t) dim_ ||
+                ds41_sys::pread(T.fd_s, s, (size_t) (dim_ / 32), (int64_t) (T.off_s + (uint64_t) r * (uint64_t) (dim_ / 32))) != (ssize_t) (dim_ / 32)) {
                 bad.fetch_add(1);
                 continue;
             }
@@ -325,6 +444,10 @@ struct Ds41Engram::Batch {
     std::vector<std::vector<uint32_t>> uniq;          // [layer] sorted unique row ids
     std::vector<std::vector<uint64_t>> packed;         // [layer] sorted (row_id << 32 | slot): no-comparator sort
     std::vector<std::vector<uint32_t>> run_begin;     // [layer] unique row -> first sorted position (size u+1)
+    // In-RAM rows (hot set / row cache) found by start(): dequantized by the pool together with the reads (was serial on
+    // the caller: a fully cached 4096-token prompt chunk took ~0.45 s single-threaded, 2026-10-19).
+    struct Hit { int32_t e; uint32_t k; const uint8_t * w; };
+    std::vector<Hit> hits;
     std::shared_ptr<Task> read_task;
     std::atomic<int> bad { 0 };
     std::atomic<uint64_t> bytes { 0 };
@@ -335,15 +458,15 @@ void Ds41Engram::drop_cache() {
     // makes the next reads pathologically slow (measured 40K reads/s vs 158K/s after windowed eviction), so windows it is.
     for (const Table & t : tables_) {
         const int fd = t.fd_w >= 0 ? t.fd_w : t.fd_s;
-        dio::Stat st;
-        if (fd < 0 || dio::fstat(fd, &st) != 0) continue;
+        ds41_sys::Stat st;
+        if (fd < 0 || ds41_sys::fstat(fd, &st) != 0) continue;
         const uint64_t win = 4ull << 30;
         for (uint64_t o = 0; o < (uint64_t) st.st_size; o += win)
-            dio::posix_fadvise(fd, (int64_t) o, (int64_t) win, POSIX_FADV_DONTNEED);
-        dio::Stat s2;
-        if (t.fd_s >= 0 && dio::fstat(t.fd_s, &s2) == 0 && s2.st_ino != st.st_ino)   // scale in another shard
+            ds41_sys::posix_fadvise(fd, (int64_t) o, (int64_t) win, POSIX_FADV_DONTNEED);
+        ds41_sys::Stat s2;
+        if (t.fd_s >= 0 && ds41_sys::fstat(t.fd_s, &s2) == 0 && s2.st_ino != st.st_ino)   // scale in another shard
             for (uint64_t o = 0; o < (uint64_t) s2.st_size; o += win)
-                dio::posix_fadvise(t.fd_s, (int64_t) o, (int64_t) win, POSIX_FADV_DONTNEED);
+                ds41_sys::posix_fadvise(t.fd_s, (int64_t) o, (int64_t) win, POSIX_FADV_DONTNEED);
     }
 }
 
@@ -382,25 +505,32 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
         rb.push_back((uint32_t) m);
         const size_t u = uq.size();
         const uint64_t bw = T.off_w, bs = T.off_s;
-        // row cache: a cached row is dequantized into its slots now and never read; groups span uncached rows only
+        // In-RAM rows (hot set first, then the row cache) are dequantized into their slots now and never read; the
+        // read groups below span the remaining rows only.
         std::vector<char> hit(u, 0);
-        if (cache_cap_) {
-            float * oe = out[(size_t) e].data();
-            for (size_t k = 0; k < u; ++k) {
+        auto emit = [&](size_t k, const uint8_t * w) {   // queued; the pool dequantizes it (rows are never rewritten)
+            b->hits.push_back(Batch::Hit{ (int32_t) e, (uint32_t) k, w });
+            hit[k] = 1;
+        };
+        if (!hot_keys_.empty()) {   // uq is ascending, so the search window only moves forward
+            const uint64_t * hk = hot_keys_.data();
+            size_t h = hot_begin_[(size_t) e];
+            const size_t hend = hot_begin_[(size_t) e + 1];
+            for (size_t k = 0; k < u && h < hend; ++k) {
                 if ((uint64_t) uq[k] >= (uint64_t) T.rows) continue;
+                const uint64_t key = ((uint64_t) e << 32) | uq[k];
+                h = (size_t) (std::lower_bound(hk + h, hk + hend, key) - hk);
+                if (h < hend && hk[h] == key) { ++hot_hits_; emit(k, &hot_pool_[h * (size_t) (dim + srsz)]); }
+            }
+        }
+        if (cache_cap_) {
+            std::lock_guard<std::mutex> lk(cache_mu_);   // a previous batch's reads may still be filling the cache
+            for (size_t k = 0; k < u; ++k) {
+                if (hit[k] || (uint64_t) uq[k] >= (uint64_t) T.rows) continue;
                 auto it = cache_idx_.find(((uint64_t) e << 32) | uq[k]);
                 if (it == cache_idx_.end()) { ++cache_miss_; continue; }
                 ++cache_hits_;
-                hit[k] = 1;
-                const uint8_t * w = &cache_pool_[(size_t) it->second * (size_t) (dim + srsz)];
-                const uint8_t * sc = w + dim;
-                float * o0 = oe + (size_t) (uint32_t) pk[rb[k]] * (size_t) dim;
-                for (int64_t q = 0; q < srsz; ++q) {
-                    const float f = std::ldexp(1.0f, (int) sc[q] - 127);
-                    for (int64_t x = 0; x < 32; ++x) o0[q * 32 + x] = fp8_e4m3(w[q * 32 + x]) * f;
-                }
-                for (uint32_t p = rb[k] + 1; p < rb[k + 1]; ++p)
-                    std::memcpy(oe + (size_t) (uint32_t) pk[p] * (size_t) dim, o0, (size_t) dim * sizeof(float));
+                emit(k, &cache_pool_[(size_t) it->second * (size_t) (dim + srsz)]);
             }
         }
         size_t i = 0;
@@ -419,14 +549,34 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
             i = j;
         }
     }
-    if (!b->groups.empty()) {
+    if (!b->groups.empty() || !b->hits.empty()) {
         auto t = std::make_shared<Task>();
-        t->n = (int64_t) b->groups.size();
+        const int64_t ng = (int64_t) b->groups.size();
+        constexpr int64_t HIT_CHUNK = 64;            // hits per work item
+        t->n = ng + ((int64_t) b->hits.size() + HIT_CHUNK - 1) / HIT_CHUNK;
         Batch * bp = b.get();
-        t->fn = [this, bp, dim, srsz](int64_t a, int64_t c) {
+        t->fn = [this, bp, dim, srsz, ng](int64_t a, int64_t c) {
             uint8_t bw[4096 + 512], bs[1024];
             auto & outv = *bp->out;
             for (int64_t g = a; g < c; ++g) {
+                if (g >= ng) {                       // a chunk of in-RAM rows: dequantize into the first slot, copy to the rest
+                    const size_t h0 = (size_t) (g - ng) * HIT_CHUNK, h1 = std::min(bp->hits.size(), h0 + HIT_CHUNK);
+                    for (size_t h = h0; h < h1; ++h) {
+                        const Batch::Hit & H = bp->hits[h];
+                        const auto & pk = bp->packed[(size_t) H.e];
+                        const auto & rb = bp->run_begin[(size_t) H.e];
+                        float * oe = outv[(size_t) H.e].data();
+                        const uint8_t * sc = H.w + dim;
+                        float * o0 = oe + (size_t) (uint32_t) pk[rb[H.k]] * (size_t) dim;
+                        for (int64_t q = 0; q < srsz; ++q) {
+                            const float f = std::ldexp(1.0f, (int) sc[q] - 127);
+                            for (int64_t x = 0; x < 32; ++x) o0[q * 32 + x] = fp8_e4m3(H.w[q * 32 + x]) * f;
+                        }
+                        for (uint32_t p = rb[H.k] + 1; p < rb[H.k + 1]; ++p)
+                            std::memcpy(oe + (size_t) (uint32_t) pk[p] * (size_t) dim, o0, (size_t) dim * sizeof(float));
+                    }
+                    continue;
+                }
                 const ReadGroup & G = bp->groups[(size_t) g];
                 const Table & T = tables_[(size_t) G.e];
                 if (G.len_w > sizeof bw || G.len_s > sizeof bs ||

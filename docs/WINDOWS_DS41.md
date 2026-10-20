@@ -3,6 +3,31 @@
 The DeepSeek-V4.1 engine (`tools/v41/engine`, `ds41_generate`) was Linux-only. These changes make it build and run
 natively on Windows 10/11 with an NVIDIA card. There is no WSL step.
 
+## Merged with upstream main (2026-10-20)
+
+Upstream (`Indras-Mirror/Xolotl` up to `9747b9e`) made its own native Windows port in the meantime
+(`tools/v41/engine/ds41_sys.hpp`, `build-win.bat`, `docs/WINDOWS.md`, the same `GGML_CUDA_USE_GRAPHS` fix in
+`CMakeLists.txt`). After the merge, `dio::` in `ds41_io.hpp` forwards the basic calls to `ds41_sys::` and only adds what
+the tuning below needs: `direct_align`, `disk_space`, `mem_available_gib` and `heap_check`. One upstream fix was needed:
+the new Engram hot-set loader (`Ds41Engram`, `XENGHOT1` packs) called `::pread` / `::fstat` directly and did not
+compile with MSVC. It now goes through `ds41_sys::`.
+
+The same bench as in "Second SSD" (a fresh server, then cold 8K, 16K and warm 8K requests, 1,500 tokens out,
+temperature 0, thinking off, the config with `--gpu2 1` and the mirror). The prompts were cut from the pre-merge files, so
+the text is the same as in the earlier runs. Two runs:
+
+| | prefill 8K cold / 16K / 8K warm (tok/s) | decode (tok/s) | ms per verify pass | tokens per pass |
+| --- | ---: | ---: | ---: | ---: |
+| before the merge ("Second SSD", mirror on, 2 runs) | 498-504 / 641-647 / 515-522 | 26.0-28.2 | 94-100 | |
+| after the merge, run 1 | 515 / 672 / 545 | 24.6 / 26.5 / 25.0 | 100 / 102 / 94 | 2.45 / 2.71 / 2.34 |
+| after the merge, run 2 | 517 / 675 / 537 | 25.7 / 27.0 / 24.7 | 95 / 104 / 91 | 2.45 / 2.81 / 2.25 |
+
+Prefill is 3-5% faster. Upstream's new defaults are the likely cause: a 16-row verify or prompt-tail pass is now one
+tier call (`kMaxMulti` 8 -> 16), and attention keys are gathered in F16 (`STRATA_ATTN_F16_GATHER`). The time per decode
+pass is unchanged. Decode tok/s moves with how many drafts DSpark accepts, so compare ms per pass. The before-merge
+runs also had `MIMO_CHUNK_PROF=1` set; these did not. Not checked: whether the answers are the same text as before the
+merge (upstream also changed the 1017 chat encoder), the HIP build, and Linux.
+
 ## What changed
 
 | Linux-only piece | Windows replacement |

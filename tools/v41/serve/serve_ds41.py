@@ -117,7 +117,14 @@ def to_encoder_messages(messages, tools):
     out = []
     for m in messages:
         m = dict(m)
-        m["content"] = _text(m.get("content"))
+        content = m.get("content")
+        if isinstance(content, list) and any(p.get("type") in ("image", "image_url", "input_image")
+                                              for p in content if isinstance(p, dict)):
+            m["content"] = [{**p, "type": "image_url" if p.get("type") == "input_image" else
+                            "text" if p.get("type") == "input_text" else p.get("type")}
+                            for p in content if isinstance(p, dict)]
+        else:
+            m["content"] = _text(content)
         if m.get("tool_calls"):
             calls = []
             for c in m["tool_calls"]:
@@ -184,9 +191,96 @@ def _svc_init_ds41(self, engine, tokenizer, template, *a, **k):
     assert len(eos) == 1, eos
     self.stop_ids = set(eos)
     self.effort_end = False      # #458's tail-turn trick is Qwen text; V4.1's effort lives in the first system turn
+    self.literals = {**self.literals, E.IMAGE_PLACEHOLDER: "\U000f0e20"}
 
 
 S.Service.__init__ = _svc_init_ds41
+
+
+# ---- the dashboard's routing note (Service.mode_note): the config's decode biases until a request names its own
+def _config_routing():
+    """(route_bias, route_bias_file, protect, pool) from the --config the server was started with; the engine's
+    defaults (1.0 / 0.6, no smart router) for what it doesn't set."""
+    try:
+        cfg = json.load(open(sys.argv[sys.argv.index("--config") + 1], encoding="utf-8"))
+    except (ValueError, IndexError, OSError):
+        return 1.0, 0.6, 0, 0
+    args, env = [str(x) for x in cfg.get("args", [])], cfg.get("env") or {}
+    def flag(name, dflt):
+        try:
+            return float(args[args.index(name) + 1])
+        except (ValueError, IndexError):
+            return dflt
+    def rank(name):
+        try:
+            return max(0, int(env.get(name, 0)))
+        except (TypeError, ValueError):
+            return 0
+    return flag("--route-bias", 1.0), flag("--route-bias-file", 0.6), rank("STRATA_RB_PROTECT"), rank("STRATA_RB_POOL")
+
+
+_ROUTING = _config_routing()
+
+
+def _routing_note(rb, rbf, protect, pool):
+    if protect or pool:
+        return f"smart routing (top {protect}, pool {pool}, {rb:g} / {rbf:g})"
+    if rb == 0 and rbf == 0:
+        return "exact routing"
+    for name, (a, b) in (("light", (0.25, 0.15)), ("fast", (0.5, 0.3))):
+        if abs(rb - a) < 1e-9 and abs(rbf - b) < 1e-9:
+            return f"{name} routing ({rb:g} / {rbf:g})"
+    return f"route bias {rb:g} / {rbf:g}"
+
+
+_svc_init_routing = S.Service.__init__
+
+
+def _svc_init_note(self, *a, **k):
+    _svc_init_routing(self, *a, **k)
+    self.mode_note = _routing_note(*_ROUTING)
+
+
+S.Service.__init__ = _svc_init_note
+
+
+def _expand_images_ds41(self, ids, encoded):
+    marker = self.tok.encode(E.IMAGE_PLACEHOLDER, parse_special=True)
+    if len(marker) != 1:
+        raise ValueError("the tokenizer must encode the image marker as one token")
+    out, k = [], 0
+    for token in ids:
+        if token == marker[0]:
+            if k == len(encoded):
+                raise ValueError("the prompt and its images do not match")
+            out.extend([token] * encoded[k][1])
+            k += 1
+        else:
+            out.append(token)
+    if k != len(encoded):
+        raise ValueError("the prompt and its images do not match")
+    return out
+
+
+S.Service.expand_image_tokens = _expand_images_ds41
+_Vision = S.Vision
+
+
+class Ds41Vision(_Vision):
+    """Run the reference-based encoder with the server's existing cache and ENC protocol."""
+
+    def __init__(self, cfg, log=None, env=None, lazy=False):
+        super().__init__(cfg, log=log, env=env, lazy=True)
+        args, log, env = self.spawn
+        args = [cfg.get("python") or sys.executable, str(V41 / "vision" / "ds41_vision.py"), *args[1:]]
+        if cfg.get("reference_dir"):
+            args += ["--reference-dir", os.path.abspath(cfg["reference_dir"])]
+        self.spawn = (args, log, env)
+        if not lazy and not self.lazy_vision and not self.elastic:
+            self._start()
+
+
+S.Vision = Ds41Vision
 
 # ---- tool calls: DSML
 CALLS_OPEN = f"<{E.dsml_token}{E.tool_calls_block_name}>"           # <｜DSML｜ calls>
@@ -242,6 +336,36 @@ def _op_init_ds41(self, *a, **k):
     _op_init(self, *a, **k)
     self.stream_tools = False          # the streaming scanner reads Qwen's <function=...> body
     self.dsml_hold = ""
+    self.echo_check, self.echo_hold = True, ""
+
+
+# 2026-10-19: after the server closes a thinking budget with REASONING_WRAP_UP, the 1017 sometimes repeats that sentence
+# as the first line of its answer (seen in the probe runs: the sentence correctly in the thinking AND again in the
+# answer).  Drop an exact repeat at the very start of the answer; anything else passes through unchanged.
+WRAP_SENTENCE = S.REASONING_WRAP_UP.split("</think>")[0].strip()
+
+
+def _drop_wrap_echo(self, evs):
+    out = []
+    for ev in evs:
+        if not self.echo_check or ev.kind != "content":
+            if self.echo_check and self.echo_hold and ev.kind != "reasoning":   # flush a held prefix before anything else
+                out.append(F.Event("content", self.echo_hold)); self.echo_hold = ""; self.echo_check = False
+            out.append(ev)
+            continue
+        self.echo_hold += ev.text
+        head = self.echo_hold.lstrip()
+        if not head or WRAP_SENTENCE.startswith(head):
+            continue                                   # still could be the echo: hold it
+        self.echo_check = False
+        if head.startswith(WRAP_SENTENCE):
+            rest = head[len(WRAP_SENTENCE):].lstrip("\n")
+            if rest:
+                out.append(F.Event("content", rest))
+        else:
+            out.append(F.Event("content", self.echo_hold))
+        self.echo_hold = ""
+    return out
 
 
 def _strip_wrappers(self, delta: str, final: bool) -> str:
@@ -255,12 +379,17 @@ def _strip_wrappers(self, delta: str, final: bool) -> str:
 
 
 def _op_feed_ds41(self, delta: str):
-    return _op_feed(self, _strip_wrappers(self, delta, False))
+    return _drop_wrap_echo(self, _op_feed(self, _strip_wrappers(self, delta, False)))
 
 
 def _op_finish_ds41(self, *a, **k):   # *a/**k: the 0.1.44 server's finish(reason=...)
     out = _op_feed(self, _strip_wrappers(self, "", True)) if self.dsml_hold else []
-    return out + _op_finish(self, *a, **k)
+    out = _drop_wrap_echo(self, out + _op_finish(self, *a, **k))
+    if self.echo_hold:                 # ended while matching: the whole sentence = the echo, a part of it = real text
+        if self.echo_hold.strip() != WRAP_SENTENCE:
+            out.append(F.Event("content", self.echo_hold))
+        self.echo_hold = ""
+    return out
 
 
 F.OutputParser.__init__ = _op_init_ds41
@@ -274,8 +403,7 @@ S.OutputParser = F.OutputParser
 import threading as _th
 import time as _time
 
-import tempfile as _tempfile  # noqa: E402
-_TEXT_LOG = os.environ.get("STRATA_TEXT_LOG", os.path.join(_tempfile.gettempdir(), "strata-ds41-text.log"))
+_TEXT_LOG = os.environ.get("STRATA_TEXT_LOG", os.path.join(__import__("tempfile").gettempdir(), "strata-ds41-text.log"))
 _text_lock = _th.Lock()
 _text_state = {"kind": None}
 _KIND_LABEL = {"reasoning": "thinking", "content": "answer", "tool_start": "tool call", "tool_call": "tool call"}
@@ -309,7 +437,27 @@ def _note_ds41(self, n, evs, st=None, rate=None):
     return _svc_note(self, n, evs, st, rate)
 
 
+# a model name ending in one of these (a config alias) = that routing for the request, for the strata_tune keys the
+# request doesn't name: -exact = no decode biases (quality mode), -fast = the stronger 0.5 / 0.3 nudge (speed mode); the
+# plain name gets the config's --route-bias / --route-bias-file
+ROUTE_SUFFIXES = {"-exact": {"route_bias": 0.0, "route_bias_file": 0.0},
+                  "-fast": {"route_bias": 0.5, "route_bias_file": 0.3}}
+
+
 def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel, **kw):   # **kw: the server's newer keywords (0.1.44: force=)
+    model = sampling.get("model") if isinstance(sampling, dict) else None
+    suffix = next((s for s in ROUTE_SUFFIXES if isinstance(model, str) and model.endswith(s)), None)
+    if suffix:
+        tune = dict(sampling.get("strata_tune") or {}) if isinstance(sampling.get("strata_tune"), dict) else {}
+        for k, v in ROUTE_SUFFIXES[suffix].items():
+            tune.setdefault(k, v)
+        sampling = {**sampling, "strata_tune": tune}
+    tune = sampling.get("strata_tune") if isinstance(sampling, dict) and isinstance(sampling.get("strata_tune"), dict) else {}
+    def num(k, dflt):
+        v = tune.get(k)
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else dflt
+    self.mode_note = _routing_note(num("route_bias", _ROUTING[0]), num("route_bias_file", _ROUTING[1]),
+                                   int(num("route_protect", _ROUTING[2])), int(num("route_pool", _ROUTING[3])))
     t0 = _time.time()
     _text_state["kind"] = None
     _text_write(f"\n\n===== {_time.strftime('%Y-%m-%d %H:%M:%S')}  request: prompt {len(ids):,} tokens, max {max_new}, "

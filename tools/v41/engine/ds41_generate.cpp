@@ -4,7 +4,7 @@
 // the server's job: tools/v41/serve/serve_ds41.py).
 //
 //   ds41_generate -m V41-GSQ.gguf (--ids 1,2,3 | --ids-file f.i32) [-n 64] [--backend cuda|cpu] [--experts gpu|cpu]
-//                 [--engram DIR:DIR:DIR] [--slots auto|N] [--vram-margin GiB] [--arena-gib 60] [--rank r.bin]
+//                 [--engram DIR:DIR:DIR] [--engram-hot hot.bin] [--slots auto|N] [--vram-margin GiB] [--arena-gib 60] [--rank r.bin]
 //                 [--vram-lru] [--arena-adapt] [--pcie 0.25] [--tier-batch-pcie 1.0] [--prefill-chunk N] [--prompt-batch B] [--chunk-mmq] [--ctx N]
 //                 [--temp 0] [--seed 1] [--stop id,id] [--ppl] [--no-actquant] [--kv-fp4] [--serve] [--quiet]
 //                 [--enc-skip|--no-enc-skip] [--enc-replay N] [--dump-last F]
@@ -16,6 +16,7 @@
 //
 // --serve speaks Strata's engine line protocol (~/AI/Strata/serve/server.py StrataEngine, as glm_generate):
 //   in:  GEN <max_new> [temperature=.. top_p=.. top_k=.. min_p=.. seed=..] <ids csv> | STOP | QUIT
+//        GENI <max_new> [k=v ..] <image embeddings file> <ids csv>   (GEN with vision; see --image-token)
 //   out: READY <ctx> stop, RESUME <reused>, PP <read> <total> <ms> <tok/s>, T <id>, DONE ..., ERR <text>
 // Conversation reuse: a request that extends what the state has seen continues; one that shares the last prompt
 // restores the snapshot taken at its end (Ds41Dense::snapshot: every other cache is position-indexed); the same prompt
@@ -61,12 +62,6 @@ using namespace strata::v41;
 
 namespace {
 
-#if defined(_WIN32)
-constexpr char kPathSep = ';';
-#else
-constexpr char kPathSep = ':';
-#endif
-
 struct Args {
     std::string model, ids_csv, ids_file, rank, dump_logits, dump_last;
     std::string build_mirror;      // --build-mirror F [--mirror-gib N]: write the blob mirror (coldest experts by --rank) and exit
@@ -81,6 +76,7 @@ struct Args {
     float route_bias = 1.0f;      // --route-bias X: selection bonus +X on the experts resident in VRAM at the seed (DEFAULT 1.0, Mal 2026-10-11:
                                   // ~4x decode; 4096-tok ppl code 2.38 -> 2.67, agentic 15.1 -> 6.9; --route-bias 0 = exact routing)
     std::vector<std::string> engram;
+    std::string engram_hot;
     int n_predict = 64;
     std::string backend = "cuda", experts = "gpu";
     int64_t slots = 0;            // 0 = auto (free VRAM after the dense half, minus --vram-margin)
@@ -104,6 +100,8 @@ struct Args {
     int gpu2_piece = 4096;        // --gpu2-piece rows: rows per worker prompt call (its buffers scale with it)
     double gpu2_skip = 0.0;       // --gpu2-skip GiB|auto: the ranking's head left to this card's decode cache (auto: its expert
                                   // slot budget).  Default 0: the second card takes the head (prompts +5%, decode the same)
+    int image_token = 129264;     // --image-token N: the model's <|image|> id (each image is one run of it in the prompt)
+    bool vision = false;
 };
 
 std::vector<int> parse_csv(const std::string & s) {
@@ -112,6 +110,61 @@ std::vector<int> parse_csv(const std::string & s) {
     std::string x;
     while (std::getline(ss, x, ',')) if (!x.empty()) v.push_back(std::atoi(x.c_str()));
     return v;
+}
+
+// The image-embedding file of a GENI line: one or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then
+// n * n_embd float32) in prompt order (serve/server.py combined_embeddings_path; generate.cpp reads the same).
+static bool read_sve1(const std::string & path, std::vector<std::vector<float>> & rows, std::vector<int64_t> & counts,
+                      int64_t n_embd, int64_t max_rows, std::string & err) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { err = "cannot open the embeddings file"; return false; }
+    int32_t hdr[5];
+    int64_t total = 0;
+    for (;;) {
+        f.read(reinterpret_cast<char *>(hdr), sizeof(hdr));
+        if (f.gcount() == 0 && f.eof()) break;
+        if (f.gcount() != sizeof(hdr)) { err = "short embeddings header"; return false; }
+        if (hdr[0] != 0x31455653 || hdr[1] < 1 || hdr[2] < 1 || hdr[3] < 1 || hdr[4] != (int32_t) n_embd
+            || (int64_t) hdr[2] * hdr[3] != hdr[1] || hdr[1] > max_rows - total) {
+            err = "bad embeddings file (expected strata-vision records of width " + std::to_string(n_embd) + ")";
+            return false;
+        }
+        const int64_t n = hdr[1];
+        total += n;
+        std::vector<float> r((size_t) (n * n_embd));
+        if (f.read(reinterpret_cast<char *>(r.data()), (std::streamsize) (r.size() * 4)).gcount()
+                != (std::streamsize) (r.size() * 4)) { err = "short embeddings file"; return false; }
+        rows.push_back(std::move(r));
+        counts.push_back(n);
+    }
+    if (rows.empty()) { err = "the embeddings file has no records"; return false; }
+    return true;
+}
+
+// Map records onto image-token runs, using the row counts to split adjacent images within the same run.
+static bool map_vision(const std::vector<int> & ids, int image_token, const std::vector<std::vector<float>> & rows,
+                       const std::vector<int64_t> & counts, std::vector<float> & vis_rows,
+                       std::vector<int64_t> & vis_pos, std::string & err) {
+    size_t k = 0;
+    for (size_t i = 0; i < ids.size(); ) {
+        if (ids[i] != image_token) { ++i; continue; }
+        size_t j = i;
+        while (j < ids.size() && ids[j] == image_token) ++j;
+        const int64_t run = (int64_t) (j - i);
+        if (k >= rows.size()) { err = "the prompt has more images than the embeddings file"; return false; }
+        int64_t matched = 0;
+        while (matched < run && k < rows.size()) {
+            if (counts[k] > run - matched) { err = "an image span does not match its embeddings"; return false; }
+            matched += counts[k];
+            vis_rows.insert(vis_rows.end(), rows[k].begin(), rows[k].end());
+            ++k;
+        }
+        if (matched != run) { err = "an image span is missing embeddings"; return false; }
+        for (size_t t = i; t < j; ++t) vis_pos.push_back((int64_t) t);
+        i = j;
+    }
+    if (k != rows.size()) { err = "the embeddings file has more images than the prompt"; return false; }
+    return true;
 }
 
 bool parse(int argc, char ** argv, Args & a) {
@@ -124,7 +177,13 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "-n" || k == "--n-predict") a.n_predict = std::atoi(next().c_str());
         else if (k == "--backend") a.backend = next();
         else if (k == "--experts") a.experts = next();
-        else if (k == "--engram") { std::stringstream ss(next()); std::string d; while (std::getline(ss, d, kPathSep)) a.engram.push_back(d); }
+        else if (k == "--engram-hot") a.engram_hot = next();
+#ifdef _WIN32
+        // the Windows path-list separator: a drive letter's ':' must not split "D:\a;E:\b"
+        else if (k == "--engram") { std::stringstream ss(next()); std::string d; while (std::getline(ss, d, ';')) a.engram.push_back(d); }
+#else
+        else if (k == "--engram") { std::stringstream ss(next()); std::string d; while (std::getline(ss, d, ':')) a.engram.push_back(d); }
+#endif
         else if (k == "--slots") { const std::string v = next(); a.slots = v == "auto" ? 0 : std::atoll(v.c_str()); }
         else if (k == "--vram-margin") a.vram_margin_gib = std::atof(next().c_str());
         else if (k == "--arena-gib") a.arena_gib = std::atof(next().c_str());
@@ -175,6 +234,8 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--gpu2-gib") a.gpu2_gib = std::atof(next().c_str());
         else if (k == "--gpu2-piece") a.gpu2_piece = std::atoi(next().c_str());
         else if (k == "--gpu2-skip") { const std::string v = next(); a.gpu2_skip = v == "auto" ? -1.0 : std::atof(v.c_str()); }
+        else if (k == "--image-token") a.image_token = std::atoi(next().c_str());
+        else if (k == "--vision") a.vision = true;
         else { std::fprintf(stderr, "unknown argument %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && (a.serve || !a.ids_csv.empty() || !a.ids_file.empty() || !a.build_mirror.empty());
@@ -415,6 +476,8 @@ int main(int argc, char ** argv) {
     if (enc_skip && PB <= 1) { std::fprintf(stderr, "ds41_generate: --enc-skip needs the layer-major prompt path (--prompt-batch >= 2)\n"); return 2; }
     int64_t ER = enc_skip ? (int64_t) a.enc_replay : 0;
     dc.engram_dirs = a.engram;
+    dc.vision = a.vision;
+    dc.engram_hot = a.engram_hot;
     dc.act_quant = a.act_quant;
     // --kv-fp4 / STRATA_KV_FP4=1: the compressed KV + indexer keys packed to their exact FP4 grids (Ds41DenseConfig::kv_fp4)
     dc.kv_fp4 = a.kv_fp4 || (std::getenv("STRATA_KV_FP4") && std::getenv("STRATA_KV_FP4")[0] == '1');
@@ -779,8 +842,12 @@ int main(int argc, char ** argv) {
         // likely misses into the prefetch slots on the prefetch stream - they land under the attention.  PCIe is the
         // wall (nsys: ~100 expert DMAs per verify pass, 1.4 s of a 4.2 s decode), so a wrong guess costs a full blob:
         // docs prompt, same text: slots 0/1/2/3/6 -> verify 104.4/101.7/104.5/111.1/124.1 ms (precision 40% at 1).
+        // Its row cap stays 8 (the old kMaxMulti, i.e. the passes it was measured on): since kMaxMulti 16 a 9-16-row
+        // pass is ONE tier call too, but it ran without the prefetch before and still does (a separate experiment).
         static const int d3_pf = std::getenv("STRATA_D3_PF") ? std::atoi(std::getenv("STRATA_D3_PF")) : 1;
-        const bool pf_now = rdev1 && !no_tier_batch && d3_pf > 0 && m <= Ds41MoeTier::kMaxMulti;
+        constexpr int kD3PfRows = 8;
+        static_assert(kD3PfRows <= Ds41MoeTier::kMaxMulti, "the prefetch is consumed by ONE tier call per layer");
+        const bool pf_now = rdev1 && !no_tier_batch && d3_pf > 0 && m <= kD3PfRows;
         for (int l = 0; l < n_layer; ++l) {
             if (pf_now) {
                 pv_pred.resize((size_t) m * 16);
@@ -828,7 +895,8 @@ int main(int argc, char ** argv) {
             lap(0);
             if (rdev1 && !no_tier_batch) {
                 // D3: ONE batched per-class tier call for the pass's m tokens (the union of their experts is served
-                // once), not m run_to_dev calls.  Split at Ds41MoeTier::kMaxMulti (8: a depth-4 pass is one call).
+                // once), not m run_to_dev calls.  Split at Ds41MoeTier::kMaxMulti (16: a depth-4 pass and a 16-row
+                // lookup verify / prompt pass are one call each).
                 constexpr int kMM = Ds41MoeTier::kMaxMulti;
                 for (int off = 0; off < m; off += kMM) {
                     const int chunk = std::min(kMM, m - off);
@@ -1239,11 +1307,31 @@ int main(int argc, char ** argv) {
         std::printf("READY %d stop\n", ctxv);
         std::fflush(stdout);
         std::fprintf(stderr, "serve: ready (ctx %d, prefill chunk %d)\n", ctxv, NP);
+        // per-request decode biases (GEN keys route_bias= / route_bias_file=, from the server's "strata_tune"): a request
+        // that names neither gets the --route-bias / --route-bias-file the engine started with, so one server can answer
+        // exact-routing requests (both 0) beside the fast default without a restart.  apply_bias() writes zeros over a
+        // bias it set earlier, so an exact request never inherits the previous one's.
+        const float cfg_route_bias = a.route_bias, cfg_route_bias_file = a.route_bias_file;
+        // the smart router's ranks (route_protect= / route_pool=, engines built with STRATA_RB_SMART / _PROTECT / _POOL):
+        // a request that names neither gets the env's
+        auto env_rank = [](const char * k) { const char * e = std::getenv(k); return e ? std::max(0, std::atoi(e)) : 0; };
+        const int cfg_rprot = env_rank("STRATA_RB_PROTECT"), cfg_rpool = env_rank("STRATA_RB_POOL");
+        int cur_rprot = cfg_rprot, cur_rpool = cfg_rpool;
         std::string line;
+        bool previous_vision = false;
         while (next_line(line)) {
             if (line == "QUIT") break;
             if (line == "STOP" || line.empty()) continue;
-            if (line.rfind("GEN ", 0) != 0) { std::printf("ERR unsupported command\n"); std::fflush(stdout); continue; }
+            dense.clear_vision();
+            if (previous_vision) {
+                hist.clear();
+                snap_len = -1;
+                previous_vision = false;
+            }
+            // GENI = GEN with an image-embedding file: GENI <max_new> [k=v ..] <embeddings file> <ids csv> (the file
+            // holds one strata-vision record per image, in prompt order; the engine lands them on the image_token runs).
+            const bool geni = line.rfind("GENI ", 0) == 0;
+            if (!geni && line.rfind("GEN ", 0) != 0) { std::printf("ERR unsupported command\n"); std::fflush(stdout); continue; }
             if (gpu2_on && !gpu2.ok()) {   // the second card's worker failed in an earlier request: a fresh one (~5 s)
                 std::string e2;
                 const double tr = now_ms();
@@ -1253,19 +1341,44 @@ int main(int argc, char ** argv) {
                     std::fprintf(stderr, "gpu2: restart failed (%s) - one card for this request\n", e2.c_str());
             }
             std::istringstream ss(line);
-            std::string w, csv;
+            std::string w, csv, emb_file;
             int max_new = 0, tk = 0;
             float temp = a.temp, top_p = 1.0f, min_p = 0.0f;
+            float req_rb = cfg_route_bias, req_rbf = cfg_route_bias_file;
+            int req_rprot = cfg_rprot, req_rpool = cfg_rpool;
             ss >> w >> max_new;
             while (ss >> w) {
                 const size_t eq = w.find('=');
-                if (eq == std::string::npos) { csv = w; continue; }
+                if (eq == std::string::npos) {   // the two positionals: GENI's embeddings file then the csv (GEN: just the csv)
+                    if (geni && emb_file.empty()) emb_file = w; else csv = w;
+                    continue;
+                }
                 const std::string k = w.substr(0, eq), v = w.substr(eq + 1);
                 if (k == "temperature") temp = (float) std::atof(v.c_str());
                 else if (k == "top_p") top_p = (float) std::atof(v.c_str());
                 else if (k == "top_k") tk = std::atoi(v.c_str());
                 else if (k == "min_p") min_p = (float) std::atof(v.c_str());
                 else if (k == "seed") rng.seed((uint64_t) std::atoll(v.c_str()));
+                else if (k == "route_bias") req_rb = std::max(0.0f, (float) std::atof(v.c_str()));
+                else if (k == "route_bias_file") req_rbf = std::max(0.0f, (float) std::atof(v.c_str()));
+                else if (k == "route_protect") req_rprot = std::max(0, std::atoi(v.c_str()));
+                else if (k == "route_pool") req_rpool = std::max(0, std::atoi(v.c_str()));
+            }
+            // a changed bias is applied again just before the decode: a repeated prompt (regenerate) runs no prompt pass,
+            // and the passes are what turn the decode bias on - without this it decoded with the previous request's
+            bool bias_changed = false;
+            if (req_rb != a.route_bias || req_rbf != a.route_bias_file) {
+                a.route_bias = req_rb;
+                a.route_bias_file = req_rbf;
+                bias_changed = true;
+                std::fprintf(stderr, "serve: decode route bias %.2f, file penalty %.2f%s\n", req_rb, req_rbf,
+                             (req_rb == 0.0f && req_rbf == 0.0f) ? " (exact routing)" : "");
+            }
+            if ((req_rprot != cur_rprot || req_rpool != cur_rpool) && dense.set_route_select(req_rprot, req_rpool)) {
+                cur_rprot = req_rprot;
+                cur_rpool = req_rpool;
+                std::fprintf(stderr, "serve: smart routing: exact top %d always kept, picks inside the exact top %d%s\n",
+                             req_rprot, req_rpool, (req_rprot == 0 && req_rpool == 0) ? " (off: the flat bias)" : "");
             }
             std::vector<int> ids = csv.empty() ? std::vector<int>() : parse_csv(csv);
             if (ids.empty()) { std::printf("ERR empty prompt\n"); std::fflush(stdout); continue; }
@@ -1273,6 +1386,32 @@ int main(int argc, char ** argv) {
                 std::printf("ERR prompt (%zu) + max tokens (%d) exceed the context (%d)\n", ids.size(), max_new, ctxv);
                 std::fflush(stdout);
                 continue;
+            }
+            // vision: resolve this request's image rows onto its image_token runs and hand them to the dense layers
+            std::vector<float> vis_rows;
+            std::vector<int64_t> vis_pos;
+            const bool is_vision = geni;
+            if (is_vision) {
+                if (!dense.vision()) { std::printf("ERR image input requires --vision\n"); std::fflush(stdout); continue; }
+                std::string verr;
+                std::vector<std::vector<float>> recs;
+                std::vector<int64_t> counts;
+                const int64_t ne = dense.geom().n_embd;
+                if (!read_sve1(emb_file, recs, counts, ne, (int64_t) ids.size(), verr)
+                    || !map_vision(ids, a.image_token, recs, counts, vis_rows, vis_pos, verr)) {
+                    std::printf("ERR %s\n", verr.c_str()); std::fflush(stdout); continue;
+                }
+                if (vis_rows.empty()) { std::printf("ERR GENI prompt has no image tokens\n"); std::fflush(stdout); continue; }
+                // an image prompt prefills fresh: every image span is the same run of image_token, so a token-only reuse
+                // test would "continue" a different image (same ids, different embeddings).  Empty hist / no snapshot / no park.
+                dense.drop_park();
+                park_hist.clear();
+                hist.clear();
+                snap_len = -1;
+                dense.set_vision(vis_rows.data(), vis_pos.data(), (int) vis_pos.size());
+                previous_vision = true;
+            } else {
+                dense.clear_vision();
             }
             size_t lcp = 0;
             while (lcp < hist.size() && lcp < ids.size() && hist[lcp] == ids[lcp]) ++lcp;
@@ -1614,7 +1753,8 @@ int main(int argc, char ** argv) {
                 continue;
             }
             hist = ids;
-            if (total > reused && dense.snapshot(total)) {
+            // no snapshot for an image prompt: a text request with the same ids (all image_token) would restore its embeddings
+            if (total > reused && !is_vision && dense.snapshot(total)) {
                 snap_len = total;
                 snap_logits = last_logits;
                 snap_seed.swap(cur_seed);   // this prompt's DSpark tail rows (0 rows when DSpark is off / no tail ran)
@@ -1650,7 +1790,12 @@ int main(int argc, char ** argv) {
                              (long long) tier.resident(), seed_s);
             }
             if (ok) tier.rebalance_plan();
+            if (bias_changed) {   // decode: this request's route bias + file penalty (see bias_changed)
+                bias_now = true;
+                apply_bias();
+            }
             tier.reset_stats();
+            dense.route_meter(true);
             const double td0 = now_ms();
             int gen = 0, pos = total;
             const char * finish = "length";
@@ -1672,9 +1817,10 @@ int main(int argc, char ** argv) {
                 // A match of M tokens drafts M - G + 1 (<= L, <= the pass width).  STRATA_LOOKUP_AGREE (default 1): only
                 // when the copy's first token is DSpark's own first draft.  A lookup pass with less than half accepted
                 // sits the lookup out 1, 2, 4 .. 64 passes.  DSpark steps on the verified rows either way.
-                // kVerify (s6): rows one verify pass may take - 16, as the prompt passes (pass_m splits the tier calls at
-                // kMaxMulti = 8 and the pass buffers hold 17).  A copy is accepted ~96% on edits, so the draft length
-                // was the limit at kMaxMulti - 2 = 6 (s6: 932/972 accepted in 169 passes, only +3% over DSpark's own).
+                // kVerify (s6): rows one verify pass may take - 16, as the prompt passes (pass_v splits the tier calls at
+                // kMaxMulti - 8 then, 16 now - and the pass buffers hold 17).  A copy is accepted ~96% on edits, so the
+                // draft length was the limit at the old kMaxMulti - 2 = 6 (s6: 932/972 accepted in 169 passes, only +3%
+                // over DSpark's own).
                 constexpr int kVerify = 16;
                 static const int lk_max = std::getenv("STRATA_SERVE_LOOKUP") ? std::max(0, std::min(kVerify - 2, std::atoi(std::getenv("STRATA_SERVE_LOOKUP")))) : 0;
                 static const int lk_g = std::getenv("STRATA_LOOKUP_NGRAM") ? std::max(1, std::atoi(std::getenv("STRATA_LOOKUP_NGRAM"))) : 3;
@@ -1805,6 +1951,19 @@ int main(int argc, char ** argv) {
                              (long long) gpu2.calls, (long long) gpu2.rows, gpu2.wait_ms, gpu2.worker_ms,
                              (long long) gpu2.calls_k[0], gpu2.wait_k[0], gpu2.worker_k[0],
                              (long long) gpu2.calls_k[1], gpu2.wait_k[1], gpu2.worker_k[1], gpu2.ok() ? "" : " - DOWN");
+            if (const Ds41Dense::RouteMeter rm = dense.route_meter(false); rm.on && rm.slots > 0)
+                std::fprintf(stderr, "serve: routing vs exact: %.2f%% of expert picks swapped, %.2f%% of router weight kept (%lld slots)\n",
+                             100.0 * (double) rm.swaps / (double) rm.slots, 100.0 * rm.weight_kept, rm.slots);
+            if (vram_trace) {   // who holds the card while decoding (the expert slots are the rest)
+                size_t tf = 0, tt = 0;
+                ggml_backend_dev_memory(ggml_backend_get_device(be), &tf, &tt);
+                double dsp_gib = 0.0;
+#if defined(DS41_HAVE_DSPARK)
+                if (dsp) dsp_gib = (double) dsp->weight_bytes() / 1073741824.0;
+#endif
+                std::fprintf(stderr, "vram ledger: %s; DSpark weights %.2f GiB; free %.2f of %.2f GiB\n",
+                             dense.vram_ledger().c_str(), dsp_gib, tf / 1073741824.0, tt / 1073741824.0);
+            }
 #if defined(DS41_HAVE_DSPARK)
             if (rq_pass > 0)
                 std::fprintf(stderr, "serve: DSpark %ld passes, %.2f tokens/pass (all requests %.2f)\n", rq_pass,

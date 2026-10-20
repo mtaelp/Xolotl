@@ -35,7 +35,7 @@ import v41_gptq as G  # noqa: E402
 
 # V41_SRC="dir1:dir2:..." = another checkpoint (e.g. the 1017): dir1 = MAIN (config, index, tokenizer), every dir is
 # searched for <shard>.ok.  Unset = the dealignai FP8 below.  Read by v41_calib, calib_layers.sh, v41_gguf, v41_sidecar.
-_SRC = [d for d in os.environ.get("V41_SRC", "").split(":") if d]
+_SRC = [d for d in os.environ.get("V41_SRC", "").split(os.pathsep) if d]
 MAIN = _SRC[0] if _SRC else "/media/Crucial1TB/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8"
 DIRS = _SRC or [MAIN, "/media/mal/NVME1TB/Models/DeepSeek-V4.1-Flash-UNCENSORED-FP8",   # shard 48 (Engram L14) copied here 2026-10-11: NVMe, not Team CX2
                 "/media/mal/Crucible/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8",
@@ -402,7 +402,15 @@ def act_hessians(xf, W1, W3, gf, lim):
     return H1, H2
 
 
-def screen_expert(exp, xe, ge, fit, lim, min_fit, damps=(0.01,)):
+# V41_SCREEN_RTN=1: screen with RTN only (no per-tier GPTQ - that was ~88 % of a calibration layer).  Measured on the
+# 1017 stats (2026-10-19, 15,096 experts): spearman(RTN err, GPTQ err) 0.992 / 0.995 / 0.996 per tier, and the map
+# picked from RTN errors scaled by these median GPTQ/RTN ratios had -0.77 % TRUE GPTQ cost vs the GPTQ-picked map
+# (88.6 % same tier, same bytes).  e_/egu_/edn_ then hold RTN x ratio (GPTQ-equivalent); rtn_ stays the raw RTN.
+SCREEN_RTN = os.environ.get("V41_SCREEN_RTN") == "1"
+RTN2GPTQ = {"ptq1": 0.657, "q2_0": 0.728, "q3_k": 0.742}
+
+
+def screen_expert(exp, xe, ge, fit, lim, min_fit, damps=(0.01,), layer=None, expert=None):
     """GPTQ + RTN at every tier on the fit tokens, output error on the held-out tokens.  Returns a stats dict."""
     W1 = K.dequant_fp4_weight(exp.w1.weight, exp.w1.scale)
     W3 = K.dequant_fp4_weight(exp.w3.weight, exp.w3.scale)
@@ -423,6 +431,17 @@ def screen_expert(exp, xe, ge, fit, lim, min_fit, damps=(0.01,)):
     Y = expert_f(xv, W1, W3, W2, gv, lim)
     st["y_energy"] = float(Y.square().sum())
     err = lambda q1, q3, q2: sq_err(xv, q1, q3, q2, gv, lim, Y)
+    if SCREEN_RTN:
+        _, Qr1 = G.quantize_stack([W1, W3], H1, TIERS, damp=damps[0], do_gptq=False)
+        _, Qr2 = G.quantize_stack([W2], H2, TIERS, damp=damps[0], do_gptq=False)
+        st["screen"] = "rtn"
+        for t in TIERS:
+            f = RTN2GPTQ[t]
+            st[f"rtn_{t}"] = e = err(Qr1[t][0], Qr1[t][1], Qr2[t][0])
+            st[f"e_{t}"] = f * e
+            st[f"egu_{t}"] = f * err(Qr1[t][0], Qr1[t][1], W2)
+            st[f"edn_{t}"] = f * err(W1, W3, Qr2[t][0])
+        return st
     for di, damp in enumerate(damps):   # several damps (sweep): keys after the first get an "@damp" suffix
         sfx = "" if di == 0 else f"@{damp:g}"
         Qg1, Qr1 = G.quantize_stack([W1, W3], H1, TIERS, damp=damp, do_gptq=do_gptq)
