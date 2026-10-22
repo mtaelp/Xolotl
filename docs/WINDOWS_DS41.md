@@ -632,6 +632,14 @@ already did this for Codex.
 | OpenAI, held 254 s (hit max_tokens) | 20.2 s (13 empty-delta chunks) |
 | Anthropic, held 92 s | 20.1 s (4 `ping` events) |
 
-`serve/test_server.py` (314 tests) and the keep-alive tests pass. Seen while testing, not fixed: a forced
-`tool_choice` on DS4.1 writes the DSML call opening and then a Qwen-style `<function=...>` line, so the call comes
-back as text. Clients that leave the choice on auto (pi) are not affected.
+`serve/test_server.py` (314 tests) and the keep-alive tests pass.
+
+## Forced tool_choice (2026-10-22)
+
+A forced `tool_choice` (OpenAI `required` / a named function, Anthropic `any` / `tool`) used to open the call as
+`<｜DSML｜ invoke
+<function=NAME>` - the frontend's Qwen opening after the patched call tag - and the model's call came
+back as text. `serve_ds41.py` now opens it the way DeepSeek's encoder writes one (`<｜DSML｜ calls>` then
+`<｜DSML｜ invoke name="NAME">`). Checked live: OpenAI named (thinking off) and `required` (thinking on), Anthropic
+`tool` and `any` all return a parsed tool call; `test_serve_ds41.py` passes. With a named tool the model may add a
+second call after the forced one in the same block.

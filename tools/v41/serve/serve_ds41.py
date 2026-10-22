@@ -328,6 +328,21 @@ F.CALL_START, F.CALL_END = INVOKE_OPEN, INVOKE_CLOSE
 F.FUNC_START = ""
 F.call_end = ds41_call_end
 F.parse_tool_call = ds41_parse_tool_call
+_forced_call = F.forced_call
+
+
+def ds41_forced_call(tool_choice, tools):
+    """The frontend decides whether (and which) call is forced; its opening is Qwen's `<function=NAME>`, which after
+    the patched CALL_START came out as `<｜DSML｜ invoke\\n<function=NAME>` - the model went on in that mixed form and
+    the call reached the client as text.  Open it the way the encoder writes one: the calls block, then the invoke."""
+    qwen = _forced_call(tool_choice, tools)
+    if qwen is None:
+        return None
+    m = re.search(r"<function=([^>\n]*)>", qwen)
+    return f'{CALLS_OPEN}\n{INVOKE_OPEN} name="' + (f'{m.group(1)}">\n' if m else "")
+
+
+F.forced_call = S.forced_call = ds41_forced_call
 _op_init, _op_feed, _op_finish = F.OutputParser.__init__, F.OutputParser.feed, F.OutputParser.finish
 WRAPPERS = (CALLS_OPEN, CALLS_CLOSE)
 
