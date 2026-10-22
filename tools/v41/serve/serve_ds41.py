@@ -275,6 +275,23 @@ class Ds41Vision(_Vision):
         args = [cfg.get("python") or sys.executable, str(V41 / "vision" / "ds41_vision.py"), *args[1:]]
         if cfg.get("reference_dir"):
             args += ["--reference-dir", os.path.abspath(cfg["reference_dir"])]
+        # "weights": the full-precision tower in place of the sidecar's Q8_0 copy (a safetensors file with the
+        # checkpoint's vision.* / aligner.* / image_*, the checkpoint folder, or an mmproj GGUF); "mmproj" stays the config
+        if cfg.get("weights"):
+            args += ["--vision-weights", os.path.abspath(os.path.expanduser(str(cfg["weights"])))]
+        # the encoder's numerics / placement (ds41_vision.py): "dtype" f32 (default) | bf16 | f16, "device" cpu | cuda
+        # (the server's own "gpu": true already passes --gpu = cuda); on the card "offload": true keeps the weights in
+        # pinned RAM between images, "tf32": true, "warmup_tokens": N (the warm-up grid; default max_tokens / 1024)
+        if cfg.get("dtype"):
+            args += ["--dtype", str(cfg["dtype"])]
+        if cfg.get("device"):
+            args += ["--device", str(cfg["device"])]
+        if cfg.get("offload") is True:
+            args.append("--offload")
+        if cfg.get("tf32") is True:
+            args.append("--tf32")
+        if cfg.get("warmup_tokens"):
+            args += ["--warmup-tokens", str(int(cfg["warmup_tokens"]))]
         self.spawn = (args, log, env)
         if not lazy and not self.lazy_vision and not self.elastic:
             self._start()
@@ -328,21 +345,27 @@ F.CALL_START, F.CALL_END = INVOKE_OPEN, INVOKE_CLOSE
 F.FUNC_START = ""
 F.call_end = ds41_call_end
 F.parse_tool_call = ds41_parse_tool_call
-_forced_call = F.forced_call
-
-
+# frontend.forced_call writes the forced-call (tool_choice) prefix in Qwen's `<function=NAME>` shape; V4.1's
+# DSML puts the name in the call OPENER itself, so a forced call has to be written in that shape here.  It opens the
+# calls block first, as the encoder writes one (a bare invoke without it: the model drifted back to text).
 def ds41_forced_call(tool_choice, tools):
-    """The frontend decides whether (and which) call is forced; its opening is Qwen's `<function=NAME>`, which after
-    the patched CALL_START came out as `<｜DSML｜ invoke\\n<function=NAME>` - the model went on in that mixed form and
-    the call reached the client as text.  Open it the way the encoder writes one: the calls block, then the invoke."""
-    qwen = _forced_call(tool_choice, tools)
-    if qwen is None:
+    """tool_choice -> the DSML text that opens the call the reply must make (None: the model decides)."""
+    kind, name = F.tool_choice_of(tool_choice)
+    names = {t.get("name") for t in tools or [] if isinstance(t, dict)}
+    if kind in ("auto", "none"):
         return None
-    m = re.search(r"<function=([^>\n]*)>", qwen)
-    return f'{CALLS_OPEN}\n{INVOKE_OPEN} name="' + (f'{m.group(1)}">\n' if m else "")
+    if kind == "required" and len(names) == 1:
+        kind, name = "named", next(iter(names))
+    if kind == "required" and names:
+        return f'{CALLS_OPEN}\n{INVOKE_OPEN} name="'
+    if kind == "named" and name in names:
+        return f'{CALLS_OPEN}\n{INVOKE_OPEN} name="{name}">\n'
+    return None
 
 
-F.forced_call = S.forced_call = ds41_forced_call
+F.forced_call = ds41_forced_call
+if hasattr(S, "forced_call"):
+    S.forced_call = ds41_forced_call
 _op_init, _op_feed, _op_finish = F.OutputParser.__init__, F.OutputParser.feed, F.OutputParser.finish
 WRAPPERS = (CALLS_OPEN, CALLS_CLOSE)
 
@@ -412,6 +435,44 @@ F.OutputParser.feed = _op_feed_ds41
 F.OutputParser.finish = _op_finish_ds41
 S.OutputParser = F.OutputParser
 
+# ---- "parallel": N (#465's batch slots) on the DeepSeek-V4.1 engine.  ds41_generate --serve runs Strata's slot protocol
+# itself (BGEN / BADM / BT / BDONE / BSTOP / BYIELD: the server's generate_batched, unchanged) when started with
+# --batch N (= its --batch-slots N): INFO batch_slots=N.  The server's own parallel_args is Strata's: it skips the flag
+# whenever the args hold "--slots" - for ds41 that is the VRAM EXPERT cache, not batch slots - and caps at 8, where a
+# ds41 window takes 16 rows (one per slot).  When the engine cannot run the slots (no conversation pool, a build
+# without them) it says why in its log and the server says "N asked, the engine runs one at a time".
+DS41_PARALLEL_MAX = 16
+
+
+def ds41_parallel_args(cfg: dict, args: list[str]) -> list[str]:
+    if "--batch" in args or "--batch-slots" in args:
+        return []
+    n = cfg.get("parallel")
+    if n is None or n is False:
+        return []
+    if isinstance(n, bool) or not isinstance(n, int):
+        print(f'[strata] "parallel" must be a whole number of requests (2..{DS41_PARALLEL_MAX}), not {n!r}: ignored',
+              flush=True)
+        return []
+    if n <= 1:
+        return []
+    if os.environ.get("STRATA_DS41_PARALLEL", "1") == "0":
+        print(f'[strata] "parallel": {n} ignored: the DeepSeek-V4.1 engine\'s batch slots are turned off '
+              "(STRATA_DS41_PARALLEL=0); one request at a time", flush=True)
+        return []
+    if "--conversation-cache-mib" in args and args[args.index("--conversation-cache-mib") + 1:][:1] == ["0"]:
+        print(f'[strata] "parallel": {n} ignored: the DeepSeek-V4.1 engine\'s batch slots need its conversation pool '
+              "(--conversation-cache-mib 0 turns it off); one request at a time", flush=True)
+        return []
+    if n > DS41_PARALLEL_MAX:
+        print(f'[strata] "parallel": {n} - the DeepSeek-V4.1 engine runs at most {DS41_PARALLEL_MAX} requests together '
+              f"(a batch window is {DS41_PARALLEL_MAX} rows); it will use {DS41_PARALLEL_MAX}", flush=True)
+        n = DS41_PARALLEL_MAX
+    return ["--batch", str(n)]
+
+
+S.parallel_args = ds41_parallel_args
+
 # ---- full text log (llama.cpp-style): every request's thinking / answer / tool calls as they are generated, so a run
 # can be watched (`tail -f`) and checked afterwards (loops, what it was thinking).  STRATA_TEXT_LOG=<path> (default
 # /tmp/strata-ds41-text.log), STRATA_TEXT_LOG=0 = off.
@@ -420,7 +481,8 @@ import time as _time
 
 _TEXT_LOG = os.environ.get("STRATA_TEXT_LOG", os.path.join(__import__("tempfile").gettempdir(), "strata-ds41-text.log"))
 _text_lock = _th.Lock()
-_text_state = {"kind": None}
+_text_state = {"kind": None, "who": None, "n": 0}
+_text_req = _th.local()   # "parallel": requests write at once - each chunk says whose it is when the writer changes
 _KIND_LABEL = {"reasoning": "thinking", "content": "answer", "tool_start": "tool call", "tool_call": "tool call"}
 
 
@@ -443,9 +505,10 @@ def _note_ds41(self, n, evs, st=None, rate=None):
         if not ev.text:
             continue
         label = _KIND_LABEL.get(ev.kind, ev.kind)
-        if label != _text_state["kind"]:
-            _text_state["kind"] = label
-            out.append(f"\n--- {label} ---\n")
+        who = getattr(_text_req, "n", None)
+        if label != _text_state["kind"] or who != _text_state["who"]:
+            _text_state["kind"], _text_state["who"] = label, who
+            out.append(f"\n--- {label} ---\n" if who is None or not getattr(self.engine, "batch", 0) else f"\n--- [#{who}] {label} ---\n")
         out.append(ev.text)
     if out:
         _text_write("".join(out))
@@ -455,7 +518,7 @@ def _note_ds41(self, n, evs, st=None, rate=None):
 # a model name ending in one of these (a config alias) = that routing for the request, for the strata_tune keys the
 # request doesn't name: -exact = no decode biases (quality mode), -fast = the stronger 0.5 / 0.3 nudge (speed mode); the
 # plain name gets the config's --route-bias / --route-bias-file
-ROUTE_SUFFIXES = {"-exact": {"route_bias": 0.0, "route_bias_file": 0.0},
+ROUTE_SUFFIXES = {"-exact": {"route_bias": 0.0, "route_bias_file": 0.0, "route_bias_remote": 0.0},
                   "-fast": {"route_bias": 0.5, "route_bias_file": 0.3}}
 
 
@@ -475,7 +538,10 @@ def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel, **kw):   # 
                                    int(num("route_protect", _ROUTING[2])), int(num("route_pool", _ROUTING[3])))
     t0 = _time.time()
     _text_state["kind"] = None
-    _text_write(f"\n\n===== {_time.strftime('%Y-%m-%d %H:%M:%S')}  request: prompt {len(ids):,} tokens, max {max_new}, "
+    with _text_lock:
+        _text_state["n"] += 1
+        _text_req.n = _text_state["n"]
+    _text_write(f"\n\n===== {_time.strftime('%Y-%m-%d %H:%M:%S')}  request #{_text_req.n}: prompt {len(ids):,} tokens, max {max_new}, "
                 f"thinking {'on' if thinking else 'off'}, tools {len(tools or [])} =====\n")
     end = "(stream closed)"
     try:
@@ -485,11 +551,54 @@ def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel, **kw):   # 
                 end = f"finish {d.get('finish')}, {d.get('completion_tokens')} tokens"
             yield item
     finally:
-        _text_write(f"\n===== end: {end}, {_time.time() - t0:.1f} s =====\n")
+        _text_write(f"\n===== end #{_text_req.n}: {end}, {_time.time() - t0:.1f} s =====\n")
 
 
 S.Service._note = _note_ds41
 S.Service.run = _run_ds41
+
+
+def _cache_slots_value(slots):
+    """Engine flag value for --conversation-cache-slots; None = omit (engine default)."""
+    if slots is None:
+        return None
+    if isinstance(slots, str) and slots.strip().lower() in ("auto", "default", ""):
+        return None
+    return str(int(slots))
+
+
+def expand_ds41_config_cache(cfg: dict) -> None:
+    """Flatten nested conversation_cache / prompt_cache; accept slots: \"auto\" (do not int() it)."""
+    args = list(cfg.get("args") or [])
+    cc = cfg.get("conversation_cache")
+    if isinstance(cc, dict):
+        mib = cc.get("mib", cc.get("budget_mib"))
+        if mib is not None and "--conversation-cache-mib" not in args:
+            args += ["--conversation-cache-mib", str(int(mib))]
+        slots = _cache_slots_value(cc.get("slots"))
+        if slots is not None and "--conversation-cache-slots" not in args:
+            args += ["--conversation-cache-slots", slots]
+        every = cc.get("prompt_cache_every", cc.get("every"))
+        if every is not None and "--prompt-cache-every" not in args:
+            args += ["--prompt-cache-every", str(int(every))]
+        pc = cc.get("prompt_cache")
+        if pc is not None and "--prompt-cache" not in args:
+            if isinstance(pc, str) and pc.strip().lower() in ("auto", "default", ""):
+                pass
+            else:
+                args += ["--prompt-cache", str(int(pc))]
+        cfg["args"] = args
+
+
+_engine_args = S.engine_args
+
+
+def engine_args_ds41(cfg: dict) -> list[str]:
+    expand_ds41_config_cache(cfg)
+    return _engine_args(cfg)
+
+
+S.engine_args = engine_args_ds41
 
 if __name__ == "__main__":
     for i, v in enumerate(sys.argv[:-1]):   # paths are the caller's; the server runs from Strata's directory

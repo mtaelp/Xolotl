@@ -18,3 +18,5 @@ void ds41_ptq1_to_q2_0_strided(const void* src, size_t src_stride, void* dst, si
 void ds41_add_rows_f32(float* dst, const int32_t* rows, const float* src, int nrows, int64_t H, void* stream);
 /// --gpu2 worker: one tiny block spinning ~`us` microseconds at `clock_khz` (keeps the card's clocks up), on `stream`.
 void ds41_spin_us(double us, int clock_khz, void* stream);
+/// dst[i] += src[i] for i < n (device floats) on `stream` - the remote tier's rows added to an out_dev call.
+void ds41_add_f32(float* dst, const float* src, size_t n, void* stream);

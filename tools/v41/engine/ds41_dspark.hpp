@@ -35,6 +35,7 @@ struct Ds41DSparkConfig {
     /// The trunk's F16 token_embd rows already in memory (Ds41Dense::token_embd), or nullptr = read them through a
     /// mapping of main_gguf.  Given, the mapping is released after load on Windows (see Ds41Dense::token_embd).
     const uint8_t * token_embd = nullptr;
+    int cuda_device = -1;   ///< CUDA ordinal for cudaSetDevice around graph compute (layer-split head GPU)
 };
 
 class Ds41DSpark {

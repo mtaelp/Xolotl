@@ -3,6 +3,89 @@
 The DeepSeek-V4.1 engine (`tools/v41/engine`, `ds41_generate`) was Linux-only. These changes make it build and run
 natively on Windows 10/11 with an NVIDIA card. There is no WSL step.
 
+## Second merge with upstream main (2026-10-22)
+
+Upstream `d4f6506` (109 commits) added batch slots, the conversation pool (`--conversation-cache-mib`, default 8192,
+pinned), a multi-GPU layer split, a remote expert card (`--remote-device`), the GPU image encoder and `--vision-weights`,
+forced tool calls in DSML, exact partial resumes and its own Windows build fixes. Where upstream does the same job,
+the merge takes upstream's code:
+
+- Image prompts are reused through the pool's position identities (upstream), not our embedding-row hashes.
+- Forced `tool_choice`: upstream's `ds41_forced_call`, plus our calls-block opener (`<｜DSML｜ calls>` before the
+  invoke). A bare invoke without it is what made the model fall back to text before.
+- Kept from this branch: `--gpu2` (now started from a `before_tier` hook in `ds41_build_pipeline`, so it runs between
+  the dense half and the tier; it cannot be combined with `--layer-split`), the blob mirror, the `dio::` layer, the
+  4 GiB pinned-arena pieces (upstream's `STRATA_ARENA_PIN_AFTER` stays Linux-only), and the 16-token rewind
+  (`restore_to`). The pool covers a re-rendered last token only when that turn was saved to the pool, so the rewind
+  runs first for the live conversation.
+- `Ds41MoeImpl` has upstream's `remote` (the in-process remote card) and our `gpu2` (the worker process) side by
+  side. The in-process card cannot be used here: a second card in the engine's process loses its VRAM under WDDM once
+  the 96 GiB arena is pinned (see "Dual GPU").
+- Windows fixes needed in upstream's new code: `ds41_vision.py`'s new weight readers used `os.pread` and `os.open`
+  without `O_BINARY`; the sidecar reader's new `close()` assumed a descriptor ours does not have, so the encoder did not
+  start.
+
+Same-day bench (fresh server per run, the pinned corpus from the first merge, cold 8K / 16K / warm 8K, 1,500 tokens
+out, `--gpu2 1`, mirror on). The pre-merge exe ran under the new server code:
+
+| | prefill (tok/s) | decode (tok/s) |
+| --- | ---: | ---: |
+| pre-merge exe, no vision | 507 / 630 / 437 | 24.5 / 24.0 / 23.7 |
+| merged, no vision | 510 / 533 / 512 | 28.2 / 31.0 / 30.5 |
+| pre-merge exe, CPU encoder | 507 / 620 / 479 | 24.0 / 23.8 / 22.4 |
+| merged, CPU encoder (2 runs) | 509 / 595 / 504, 498 / 602 / 445 | 28.7-30.4, 28.8-30.0 |
+
+8K prefill is unchanged. The 16K and warm-8K cases move by 10-15% between runs of the same exe, in both directions.
+Decode is 15-25% faster after the merge. The first-merge numbers (515 / 672 / 545) were taken without the image encoder
+on a different day. The pre-merge exe gives 504-507 / 553-630 today, so that gap is the machine and not the merge.
+
+### Image encoder: CPU vs GPU
+
+One fresh server per placement. Text bench as above, then `check_api.py`, then DeepSeek's `carrots.jpeg` (444 image
+tokens) twice. The second request hits the server's image cache and reuses 454 tokens.
+
+| encoder | prefill 8K / 16K / warm 8K | check_api (s per request) | carrots: 1st request, decode | 2nd |
+| --- | ---: | ---: | ---: | ---: |
+| CPU, f32, 8 threads (config) | 498 / 602 / 445 | 8.3 / 8.2 / 4.9 / 1.0, PASS | 19.9 s, 17.8 tok/s | 1.5 s |
+| 5090, resident (`"device": "cuda"`) | 504 / 661 / 525 | 8.5 / 7.0 / 12.1 / 1.9, PASS | 28.3 s, **2.1 tok/s** | 16.6 s, 2.2 tok/s |
+| 5090, `"offload": true` | 502 / 651 / 517 | 6.6 / 5.8 / 5.1 / 1.0, PASS | **11.7 s**, 18.6 tok/s | 1.6 s |
+| 3090 (`"cuda_device": 1`, `--gpu2-reserve 7`) | 489 / 642 / 509 | 4.3 / 4.5 / 5.3 / 1.1, PASS | hung (300 s), then 400 | - |
+
+- Resident on the 5090, the encoder holds 1.85 GiB of weights plus a 2.65 GiB pool. Every reply in an image chat then
+  decodes at about 2 tok/s, while text-only requests are unaffected. The card is at 31.6 of 32.6 GB.
+- With `offload`, the weights stay in pinned RAM and are copied to the card for each image. This was the fastest
+  placement, with no decode cost. CUDA PyTorch (`torch 2.14.1+cu130`) is now in `venv-vision`.
+- 3090: the small `check_api` pictures were the fastest, but on the photo the 3090 fell off the bus
+  (`nvidia-smi`: "GPU is lost. Reboot the system to recover this GPU"). The OCuLink card is not safe for the encoder
+  next to the gpu2 worker.
+
+The config keeps the CPU encoder.
+
+### Long chat with a side call
+
+The case pi hits is a long chat with a short unrelated request between turns (a title or summary call). Before the
+merge, the single park held one conversation. Now the pool keeps it. Test: a 113K-token document, thinking on, 4
+turns, with a 17-token side call after turn 1. Run on the 5090 alone (the 3090 was lost, see above):
+
+| request | prompt | reused | prompt read |
+| --- | ---: | ---: | ---: |
+| turn 1 | 113,157 | 0 | 144.4 s |
+| side call | 17 | 0 | 1.2 s (the chat went to the pool) |
+| turn 2 | 113,350 | 113,156 (pool) | 5.3 s |
+| turn 3 | 113,485 | 113,349 (rewind) | 4.7 s |
+| turn 4 | 113,608 | 113,484 (rewind) | 6.0 s |
+
+One fix was needed. The pool's choice compared the pool against what the live state offers by upstream's rules,
+which do not include the rewind. So turn 3 resumed from turn 1's pool record (112,636 of 112,771), and every later
+turn would have re-read everything since turn 1. The live state now also offers `lcp` when
+`Ds41Dense::can_restore_to(lcp)` says the rewind can reach it.
+
+### Checks after the merge
+
+`test_serve_ds41.py` (all passed), `serve/test_server.py` (318 tests, OK), `check_api.py` PASS, forced `tool_choice`
+4/4 parsed calls, keep-alive: longest gap between events 20.1 s on OpenAI and Anthropic (6.5 KB tool call held
+58-68 s).
+
 ## Merged with upstream main (2026-10-20)
 
 Upstream (`Indras-Mirror/Xolotl` up to `9747b9e`) made its own native Windows port in the meantime

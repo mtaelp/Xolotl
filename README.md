@@ -46,6 +46,38 @@ DeepSeek-V4.1 with the speculative-decode draft off the card during long prompts
 - **Fast where it counts.** The Qwen models run at 100-130 tok/s; an agent's small follow-up turn on DeepSeek-V4.1
   costs ~8 s on a 6K-16K context, and the engine learns the conversation's experts between turns.
 
+## Recently added
+
+- **Batch slots** for the DeepSeek-V4.1 engine (#22, NektoDron): `"parallel": N` in a ds41 config runs several
+  requests in one pass over the model, one token each, on the server's existing slot scheduler. How it works, what a
+  slot costs and the limits: [docs/BATCHING.md](docs/BATCHING.md).
+- **Conversation pool** (#19, #20, NektoDron): every conversation is kept at its turn boundary in pinned host RAM
+  (`--conversation-cache-mib`, default 8192) and a request resumes from the longest matching prefix, pictures
+  included. Agents taking turns no longer re-read their prompts (measured on a 5090: three agents at 30-60K tokens,
+  47.5 -> 3.96 s a turn).
+- **Long prompts** past 512K tokens no longer run out of memory or crash on the pass graph (#21, NektoDron): 768K and
+  1M prompts complete.
+- **Exact resumes** (#18, NektoDron): a partial unpark resumes only inside the window ring, and the Engram history is
+  written back on every resume (bit-identical to a fresh prefill). The **image encoder runs on the GPU** with fast
+  SDPA (#17, NektoDron).
+- **Multi-GPU layer split** (AtticusG3 / buster, Niko1221, bsvinay): `--layer-split` across cards with a PCIe hand-off,
+  an optional head device for the output head + DSpark, a VRAM expert cache per GPU and sm_70 (V100) support:
+  [docs/MULTI_GPU.md](docs/MULTI_GPU.md), [BUSTER.md](BUSTER.md). Under a split the engine serves one request at a
+  time with its own split-aware conversation cache; batch slots and the pool are single-card.
+- **Remote expert card** (`--remote-device`, masahiro hibi): a second GPU holds extra experts for the first, with
+  `--route-bias-remote`.
+- Serve: STOP cancels a long prefill (clawdia-saka), `--kv-q8` / `--kv-type` for the compressed KV + indexer keys,
+  a park window floor for agent side calls, cached DSpark verify-width graphs, forced tool calls in V4.1's DSML shape,
+  and the expert-cache fixes from clawdia-saka.
+- **DeepSeek-V4.1-Flash-1017 builds** of the October checkpoint:
+  [IndrasMirror/DeepSeek-V4.1-Flash-1017-GSQ-Uncensored](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-GSQ-Uncensored)
+  (V2 142 GiB; V3 152 GiB, recalibrated on a code + agentic heavy mix). A V4 is in the works.
+- **Native Windows** for the DeepSeek-V4.1 engine (MSVC + CUDA, RTX 50 notes from #14): [docs/WINDOWS.md](docs/WINDOWS.md).
+- **Vision** input for DeepSeek-V4.1 (#8), per-request routing options (#11), a 16-row tier call (#9) and a uniform
+  VRAM expert cache under the auto slot budget (#15).
+- Engine: a VRAM breakdown in the decode trace (dense weights, DSpark draft, free memory) and per-GPU one-time setup
+  in the dense kernels.
+
 ## Quick start
 
 Linux, an NVIDIA GPU with 24 GB, CUDA 12.x/13.x, and RAM for the arena (90 GB was used above).
@@ -60,7 +92,8 @@ ninja -C build-xolotl      # strata, strata-dense, glm_generate, ds41_generate, 
 ```
 
 Get a model: DeepSeek-V4.1-Flash is **[IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored)**
-(152 GiB, our GSQ mixed ternary / 2-bit / 3-bit quant - the card has the download and Engram steps). Then serve it
+(152 GiB, our GSQ mixed ternary / 2-bit / 3-bit quant - the card has the download and Engram steps), or the newer
+**[1017 builds](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-GSQ-Uncensored)** of the October checkpoint. Then serve it
 (edit the model paths in its config first):
 
 ```bash
@@ -76,12 +109,12 @@ Then point any OpenAI- or Anthropic-compatible client at `http://127.0.0.1:<port
 
 What I've measured is one setup: **RTX 4090 (24 GB), 90 GB DDR4, Linux, NVMe**. Beyond that:
 
-- **OS:** Linux only for the DeepSeek engine for now (the launcher and the expert/Engram disk reads are Linux-specific).
-  The Strata core runs on Windows, but the DeepSeek side doesn't yet. WSL2 might work but is untested; keep the model
-  files inside WSL's own filesystem, not on a Windows drive.
+- **OS:** Linux, or Windows 11 natively (MSVC + CUDA; build and serve steps in [docs/WINDOWS.md](docs/WINDOWS.md)).
+  Everything measured here is on Linux.
 - **GPU:** NVIDIA, compute capability 7.5 or newer (RTX 20/30/40/50). Build with your card's architecture:
   `-DCMAKE_CUDA_ARCHITECTURES=86` for RTX 30, `89` for RTX 40, `120` for RTX 50 (use CUDA 13.x for RTX 50; 12.8 builds
-  had prompt-path crashes).
+  had prompt-path crashes). **Tesla V100 (sm_70):** experimental DS41-on-Buster path only — see [BUSTER.md](BUSTER.md)
+  (`STRATA_EXPERIMENTAL_SM60=ON`, CUDA 12.x, no chunk-MMQ on Volta).
 - **VRAM:** 24 GB is what I run. 16 GB should load but is untested, and prompts get processed in smaller batches, so
   prefill will be slower. Below 16 GB won't work.
 - **RAM:** 90 GB here, with a 64 GB expert cache in RAM. Less RAM means a smaller cache, so more experts come off the
@@ -106,6 +139,7 @@ pruning; the Qwen models get MTP speculative decoding. **[Read the full write-up
 | [How Xolotl works](docs/xolotl/HOW_IT_WORKS.md) | the three memory tiers, per-model engines, the server, the agent-loop work |
 | [Benchmarks](docs/xolotl/BENCHMARKS.md) | every measured number, exactness checks, how to measure your own PC |
 | [DeepSeek-V4.1-Flash engine](docs/DEEPSEEK_V41.md) | GSQ quantisation, DSpark, the fp4 KV cache, Engram |
+| [DeepSeek-V4.1 on Windows](docs/WINDOWS.md) | native MSVC + CUDA build, configs, RTX 50 notes |
 | [GLM-5.3-Flash engine](docs/glm) | KDA + MLA attention, the LoRA on routed experts, soft pruning |
 | [Qwen3.8 / upstream Strata](README.strata.md) | the Strata engine this grew from |
 | [Brand kit](docs/brand/XOLOTL_BRAND.md) | logo, banner, palette |
