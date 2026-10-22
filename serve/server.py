@@ -214,6 +214,8 @@ def focused_recovery_prompt(tok, ids, generated):
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
 KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
+EVENT_BEAT_S = 15.0         # ... and at least this often the ping is a real event, not an SSE comment: SDK-based clients
+                            # (pi, the OpenAI / Anthropic SDKs) drop comments, so only an event resets their idle timeout
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
@@ -6085,12 +6087,23 @@ def make_handler(svc: Service):
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
             self._sse()
+            last, head = time.monotonic(), None
             try:
                 for c in chunks:
                     if c is None:
-                        self.wfile.write(b": keep-alive\n\n")      # an SSE comment: clients ignore it
+                        # an SSE comment, which SDK clients drop; every EVENT_BEAT_S a chunk with an empty delta
+                        # instead, so a client's idle timeout sees the server working (a tool call held back whole)
+                        if head is not None and time.monotonic() - last >= EVENT_BEAT_S:
+                            beat = {**head, "choices": [{"index": 0, "delta": {}, "finish_reason": None}]}
+                            self.wfile.write(b"data: " + json.dumps(beat, ensure_ascii=False).encode() + b"\n\n")
+                            last = time.monotonic()
+                        else:
+                            self.wfile.write(b": keep-alive\n\n")
                     else:
+                        if head is None and c.get("object") == "chat.completion.chunk":
+                            head = {k: c[k] for k in ("id", "object", "created", "model") if k in c}
                         self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
+                        last = time.monotonic()
                     self.wfile.flush()
                 self.wfile.write(b"data: [DONE]\n\n")
             except OSError:
@@ -6308,14 +6321,21 @@ def make_handler(svc: Service):
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
             self._sse()
+            last = time.monotonic()
             try:
                 for item in events:
                     if item is None:
-                        self.wfile.write(b": keep-alive\n\n")
+                        # Anthropic's own keep-alive is a ping event; SDK clients drop SSE comments (EVENT_BEAT_S)
+                        if time.monotonic() - last >= EVENT_BEAT_S:
+                            self.wfile.write(b'event: ping\ndata: {"type": "ping"}\n\n')
+                            last = time.monotonic()
+                        else:
+                            self.wfile.write(b": keep-alive\n\n")
                     else:
                         name, e = item
                         self.wfile.write(f"event: {name}\n".encode() + b"data: " +
                                          json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
+                        last = time.monotonic()
                     self.wfile.flush()
             except OSError:
                 self._note(outcome="disconnected")

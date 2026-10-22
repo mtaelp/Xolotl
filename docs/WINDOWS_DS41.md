@@ -616,3 +616,22 @@ Measured on this PC (RTX 5090 + 3090, 7800X3D):
 
 Limits (upstream's): an image request prefills its whole prompt and the next request starts fresh, so an image in a
 long chat costs a full prompt read. The encoder uses the CPU only, and no VRAM.
+
+## Keep-alive events for SDK clients (2026-10-22)
+
+pi ("pi-ai stream idle timeout after 300000ms") cancelled six agent turns on 2026-10-21: each was a tool call writing
+a large file (10k-21k tokens, 6-19 minutes). The server sends a tool call whole once it is complete, and until then
+the stream carried only `: keep-alive` SSE comments, which SDK-based clients drop, so their idle timer ran out. The
+OpenAI and Anthropic streams now send a real event at least every 15 s while nothing else goes out (`EVENT_BEAT_S`
+in `serve/server.py`): a chunk with an empty delta (OpenAI), or Anthropic's own `ping` event. The Responses API
+already did this for Codex.
+
+| Test (thinking off, one long `write_file` call) | Longest gap between events |
+| --- | --- |
+| OpenAI, tool call held 71 s, 6,349 bytes of arguments, arrived intact | 20.1 s (4 empty-delta chunks) |
+| OpenAI, held 254 s (hit max_tokens) | 20.2 s (13 empty-delta chunks) |
+| Anthropic, held 92 s | 20.1 s (4 `ping` events) |
+
+`serve/test_server.py` (314 tests) and the keep-alive tests pass. Seen while testing, not fixed: a forced
+`tool_choice` on DS4.1 writes the DSML call opening and then a Qwen-style `<function=...>` line, so the call comes
+back as text. Clients that leave the choice on auto (pi) are not affected.
