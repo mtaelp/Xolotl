@@ -3,6 +3,34 @@
 The DeepSeek-V4.1 engine (`tools/v41/engine`, `ds41_generate`) was Linux-only. These changes make it build and run
 natively on Windows 10/11 with an NVIDIA card. There is no WSL step.
 
+## Third merge with upstream main (2026-10-23)
+
+Upstream `08e28a0` added 13 commits. Most of them are upstream's own versions of what this branch already does on
+Windows:
+
+| upstream | ours | kept |
+| --- | --- | --- |
+| `STRATA_DS41_REMOTE`: routed experts on a second GPU in a helper process (opt-in) | `--gpu2` | both. `--gpu2` stays in the config. The counters share `st.remote`, and the log names whichever is on. Not compared yet: the 3090 was not detected after the reboot. |
+| `STRATA_SERVE_REWIND1=1`: resume 1 token before the snapshot (opt-in) | `restore_to`: up to 16 back, on by default, also counted in the pool's choice | both. Ours runs first, so theirs only matters with ours declining. |
+| `STRATA_ARENA_SLICE_GIB` (opt-in) and a 32 GiB pin cap for `--remote-device` under WDDM | automatic 4 GiB fallback pieces | ours by default. Theirs when the env var is set or the cap applies. |
+| blob mirror with a buffered model file; whole-blob prompt reads (`read_staged`) from the mirror; `STRATA_BLOB_MIRROR_PART_SHARE` | mirror with unbuffered reads in place | merged: ours for `read_part`, theirs for `read_staged` and the share split |
+| `ds41_vision.py` Windows sidecar read | the same fix | upstream's. Our `_pread` helper for the other readers is now `_pread_all` on top of it. |
+
+Bench on the 5090 alone (the 3090 was not detected; same harness and corpus as below, the config's CPU image encoder,
+two alternating runs of each exe):
+
+| | prefill 8K cold / 16K / warm 8K (tok/s) | decode (tok/s) |
+| --- | ---: | ---: |
+| d682b08 (second merge) | 339 / 450 / 353, 377 / 535 / 354 | 20.4-25.3 |
+| this merge | 348 / 481 / 393, 427 / 512 / 396 | 22.2-24.4 |
+
+Warm 8K is 11% faster in both pairs. That matches the prompt's whole-blob reads now also coming from the mirror. Decode
+is unchanged.
+
+Checks: `test_serve_ds41.py` all passed, `serve/test_server.py` 318 OK, forced `tool_choice` 4/4, `check_api.py`
+PASS, keep-alive longest gap between events 20.1 s on both APIs. A 113.5K-token chat with a side call after turn 1
+read 190.9 s for turn 1, then reused 113,504 (pool) / 113,724 / 113,861 tokens on turns 2-4 (5.0-6.1 s each).
+
 ## Second merge with upstream main (2026-10-22)
 
 Upstream `d4f6506` (109 commits) added batch slots, the conversation pool (`--conversation-cache-mib`, default 8192,

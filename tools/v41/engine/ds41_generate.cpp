@@ -851,7 +851,11 @@ int main(int argc, char ** argv) {
             if (!r) { r = 1; ++got; }
         }
     }
+    // STRATA_DS41_REMOTE_BIAS=1 (with STRATA_DS41_REMOTE): the helper's experts take --route-bias's bonus too, as the
+    // ones in this card's VRAM do (they cost a round trip that runs under the layer's own work, not a PCIe copy)
+    static const bool remote_bias = std::getenv("STRATA_DS41_REMOTE_BIAS") && std::getenv("STRATA_DS41_REMOTE_BIAS")[0] == '1';
     auto resident_now = [&](int64_t l, int64_t e) {   // --gpu2: the second card's experts are VRAM-resident too
+        if (remote_bias && ds41_tier_for(pipe, (int) l).remote_holds(l, e)) return true;
         if (!proxy_res.empty()) return proxy_res[(size_t) (l * TG.n_experts + e)] != 0;
         return ds41_tier_for(pipe, (int) l).resident(l, e) || gpu2.owns(l, e);
     };
@@ -1778,6 +1782,7 @@ int main(int argc, char ** argv) {
         auto env_rank = [](const char * k) { const char * e = std::getenv(k); return e ? std::max(0, std::atoi(e)) : 0; };
         const int cfg_rprot = env_rank("STRATA_RB_PROTECT"), cfg_rpool = env_rank("STRATA_RB_POOL");
         int cur_rprot = cfg_rprot, cur_rpool = cfg_rpool;
+        static const bool rewind1 = std::getenv("STRATA_SERVE_REWIND1") && std::getenv("STRATA_SERVE_REWIND1")[0] == '1';
         std::string line;
         bool previous_vision = false;
         // ---- batch slots (--batch-slots N; the protocol is at the top of this file).  Slot s's conversation is a Conv
@@ -2452,6 +2457,19 @@ int main(int argc, char ** argv) {
                 hist.resize(lcp);
                 if (live_id.size() > lcp) live_id.resize(lcp);
                 reused = (int) lcp;
+            } else if (rewind1 && !unparked && snap_len > 1 && lcp + 1 == (size_t) snap_len && lcp < ids.size() && dense.restore()) {
+                // STRATA_SERVE_REWIND1=1 (opt-in): the request matches the snapshot's prompt except its LAST token -
+                // DeepSeek's template, in thinking mode, re-renders the previous turn's "<think>" generation prompt as
+                // "</think>" once a new user message follows (drop_thinking), so every new user message re-read the whole
+                // conversation.  Restore the snapshot and re-feed from that token: one token back is exact - after
+                // restore() the window ring holds [P - RAW, P) and the ratio-2 compressor state P - 2, P - 1, so the
+                // re-fed token's window and group partner are intact; KV / compressed / indexer rows and Engram's history
+                // are positional and are overwritten.  Two tokens back would not be (see the partial unpark above).
+                hist.resize(lcp);
+                if (live_id.size() > lcp) live_id.resize(lcp);
+                reused = (int) lcp;
+                std::fprintf(stderr, "serve: rewound the snapshot one token (%d -> %zu)\n", snap_len, lcp);
+                snap_len = -1;
             } else if (pool_on) {
                 // an unrelated request: the conversation it overwrites goes to the pool
                 save_live("unrelated");
@@ -3111,10 +3129,11 @@ int main(int argc, char ** argv) {
                 snap_len = -1;
                 finish = "length";
             }
-            std::fprintf(stderr, "serve: %d tokens in %.2f s = %.2f tok/s (%s); experts: %lld hit, %lld cpu, %lld pcie, %lld file%s\n",
+            std::fprintf(stderr, "serve: %d tokens in %.2f s = %.2f tok/s (%s); experts: %lld hit, %lld cpu, %lld pcie, %lld file",
                          gen, dec_ms / 1000.0, 1000.0 * std::max(0, gen - 1) / std::max(dec_ms, 1e-9), finish,
-                         (long long) st.hits, (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier,
-                         gpu2_on ? (", " + std::to_string(st.remote) + " gpu2").c_str() : "");
+                         (long long) st.hits, (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier);
+            if (st.remote > 0) std::fprintf(stderr, ", %lld %s", (long long) st.remote, gpu2_on ? "gpu2" : "remote");   // --gpu2 / STRATA_DS41_REMOTE
+            std::fprintf(stderr, "\n");
             if (gpu2_on)
                 std::fprintf(stderr, "serve: gpu2 so far: %lld calls, %lld rows; waited %.0f ms after this card's own work, "
                              "worker busy %.0f ms (decode/verify %lld calls %.0f / %.0f ms, prompt %lld calls %.0f / %.0f ms)%s\n",

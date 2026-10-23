@@ -153,6 +153,13 @@ def dequantize(raw, ty):
     raise ValueError(f"unsupported GGML type {ty}")
 
 
+def _pread(fd, n, off):
+    if hasattr(os, "pread"):
+        return os.pread(fd, n, off)
+    os.lseek(fd, off, os.SEEK_SET)   # Windows has no os.pread; one reader per process, so seek + read is safe
+    return os.read(fd, n)
+
+
 class SidecarWeights:
     """Reads only the vision.* / aligner.* / image_* tensors of the sidecar GGUF, by offset."""
 
@@ -162,7 +169,7 @@ class SidecarWeights:
         self.tensors = {n: (s, t, o) for n, s, t, o in tensors if n.startswith(VISION_PREFIXES)}
         if not self.tensors:
             raise ValueError(f"{path}: no vision.* / aligner.* / image_* tensors")
-        self.f = open(path, "rb")              # binary file object: Windows has no os.pread
+        self.fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))   # O_BINARY: Windows opens text otherwise
 
     def names(self):
         return sorted(self.tensors)
@@ -174,8 +181,7 @@ class SidecarWeights:
         nbytes = ggml_nbytes(shape, ty)
         raw = bytearray()
         while len(raw) < nbytes:
-            self.f.seek(self.data_start + off + len(raw))
-            b = self.f.read(nbytes - len(raw))
+            b = _pread(self.fd, nbytes - len(raw), self.data_start + off + len(raw))
             if not b:
                 raise OSError(f"{name}: short read")
             raw += b
@@ -197,26 +203,19 @@ class SidecarWeights:
         return f"sidecar GGUF {os.path.basename(self.path)} ({len(self.tensors)} tensors, {'/'.join(types)})"
 
     def close(self):
-        if self.f is not None:
-            self.f.close()
-            self.f = None
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
 
 
 _GGML_NAMES = {F32: "F32", F16: "F16", Q8_0: "Q8_0", BF16: "BF16"}
 _ST_TYPES = {"F32": (F32, 4), "F16": (F16, 2), "BF16": (BF16, 2)}
 
 
-def _pread_seek(fd, n, off):
-    """os.pread for Windows (it has none): seek + read on the descriptor (one reader per fd in this process)."""
-    os.lseek(fd, off, os.SEEK_SET)
-    return os.read(fd, n)
-
-
-def _pread(fd, nbytes, off, name):
-    pread = getattr(os, "pread", _pread_seek)
+def _pread_all(fd, nbytes, off, name):
     raw = bytearray()
     while len(raw) < nbytes:
-        b = pread(fd, nbytes - len(raw), off + len(raw))
+        b = _pread(fd, nbytes - len(raw), off + len(raw))
         if not b:
             raise OSError(f"{name}: short read")
         raw += b
@@ -268,7 +267,7 @@ class SafetensorsWeights:
 
     def get(self, name):
         fd, off, nb, ty, shape, _ = self.tensors[name]
-        return dequantize(_pread(fd, nb, off, name), ty).reshape(shape).astype(np.float32)
+        return dequantize(_pread_all(fd, nb, off, name), ty).reshape(shape).astype(np.float32)
 
     def torch(self, name, tp, dtype):
         return tp.from_numpy(np.ascontiguousarray(self.get(name))).to(dtype)
@@ -345,7 +344,7 @@ class MmprojWeights:
 
     def _one(self, n):
         shape, ty, off = self.src[n]
-        return dequantize(_pread(self.fd, ggml_nbytes(shape, ty), self.data_start + off, n), ty).reshape(shape[::-1])
+        return dequantize(_pread_all(self.fd, ggml_nbytes(shape, ty), self.data_start + off, n), ty).reshape(shape[::-1])
 
     def get(self, name):
         parts = [self._one(n) for n in self.map[name]]

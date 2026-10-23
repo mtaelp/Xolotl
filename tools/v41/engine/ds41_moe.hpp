@@ -251,11 +251,14 @@ private:
     /// `fd` / `A`: another O_DIRECT file and its alignment (the mirror) instead of the twin and `dalign_`.
     bool read_inplace(uint64_t off, size_t n, uint8_t* dst, int fd = -1, size_t A = 0) const;
     bool open_mirror(const char* path, std::string& err);
+    /// read_staged (whole blobs): does this mirrored blob come from the mirror?  mshare_ per mille, by a fixed hash.
+    bool mirror_pick(int64_t layer, int64_t expert) const;
     int mfd_ = -1;                        ///< the mirror (O_DIRECT), -1 = none
     size_t malign_ = 0;                   ///< read_inplace's alignment on the mirror (0 = off, as dalign_)
     std::vector<uint64_t> moff_;          ///< per (layer, expert): the blob's offset in the mirror, ~0 = not mirrored
     int64_t mirrored_ = 0;
     int mshare_ = 280;                    ///< per mille of a mirrored blob's parts read from the mirror
+    int mpshare_ = 280;                   ///< the same for read_part (decode misses) only
     /// read_part's aligned bounces (one per concurrent part, kept for the next call)
     uint8_t* take_bounce() const;
     void give_bounce(uint8_t* p) const;
@@ -389,10 +392,10 @@ struct Ds41MoeStats {
     int64_t vram_swaps = 0;         ///< vram_lru: misses / prefetches moved into a VRAM slot
     int64_t vram_demotes = 0;       ///< ...of which the victim went back to the arena (it had no arena copy)
     int64_t skipped = 0;            ///< skip_miss: low-weight misses dropped
-    int64_t remote = 0;             ///< --gpu2: routed entries computed on the second card (not in the counts above)
+    int64_t remote = 0;             ///< routed entries computed on a second card: --gpu2's worker or the STRATA_DS41_REMOTE helper
 
     void add(const Ds41MoeStats& o);
-    int64_t lookups() const { return hits + cpu + pcie + skipped; }
+    int64_t lookups() const { return hits + cpu + pcie + skipped + remote; }
 };
 
 class Ds41Gpu2;   // ds41_gpu2.hpp
@@ -501,6 +504,8 @@ public:
     bool in_remote(int64_t layer, int64_t expert) const;
     int64_t remote_experts() const;
     double remote_gib() const;
+    /// Whether the STRATA_DS41_REMOTE helper holds `expert` of `layer` (false without one).
+    bool remote_holds(int64_t layer, int64_t expert) const;
     /// `nt` (1..4) tokens of one layer at once - draft verification: `ids`/`w` are nt*top_k (token-major), `x` and
     /// `out` nt*n_embd.  Each distinct expert is read/fetched once and applied to every token that routed to it.
     bool run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out);
