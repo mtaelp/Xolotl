@@ -134,6 +134,24 @@ void ck(cudaError_t e, const char* what) {
     }
 }
 
+// Windows (WDDM) may hold queued GPU work until the host waits on or queries its stream (Strata's win_submit).  After
+// the kernels a layer leaves running while the host reads its SSD experts or runs the CPU pool, DS41_WIN_SUBMIT=1
+// queries the stream so that work starts now instead of at the next sync.  Elsewhere nothing.
+void win_submit(cudaStream_t s) {
+#ifdef _WIN32
+    static const bool on = [] {
+        const char* v = std::getenv("DS41_WIN_SUBMIT");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (on && s != nullptr) {
+        (void) cudaStreamQuery(s);   // cudaErrorNotReady while it runs: not an error, and not sticky
+        (void) cudaGetLastError();
+    }
+#else
+    (void) s;
+#endif
+}
+
 /// The five metadata arrays of ONE grouped launch sit in a region of the pinned h_meta block at `b`:
 /// [ptr n x u64][st n+1 x i32][ng 1 x i32][dst n x i32][tok n x i32], each part 16-byte aligned.
 struct MetaOff { size_t ptr, st, ng, dst, tok, end; };
@@ -3187,6 +3205,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
         if (npf_hit > 0) ck(cudaStreamWaitEvent(gp.s, gp.ev_pf, 0), "wait prefetch");
         launch_group(0, nh, ptr, start, dst, tok);
         ck(cudaEventRecord(gp.ev[2], gp.s), "record hits");
+        win_submit(gp.s);   // the hits run while the host reads this layer's file experts
         ev_hit = 2;
     }
     // ---- vram_lru: the layer's least-recently-used resident expert not routed to now gives up its slot ----
@@ -3297,6 +3316,8 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
         }
         launch_group(1, np, ptr, start, dst, tok);
         ck(cudaEventRecord(gp.ev[3], gp.s), "record pcie");
+        if (gp.s_dc) win_submit(gp.s_dc);
+        win_submit(gp.s);
         ev_pcie = 3;
     }
 
@@ -4289,6 +4310,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         }
     };
     launch_site(HIT);
+    win_submit(gp.s);   // the hits run while the host waits for this call's file experts
     // vram_lru, as gpu_run: a prefetched expert the pass used is copied device-to-device into a victim slot (the
     // hits kernel above read the staging copy; this copy only reads it too, and the next prefetch waits for the sync)
     if (lru && npf > 0) {
@@ -4320,6 +4342,8 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         ck(cudaEventRecord(gp.dn_ev[1], gp.s_dn), "d3 dn tail record");
         ck(cudaStreamWaitEvent(gp.s, gp.dn_ev[1], 0), "d3 dn tail wait");
     }
+    if (dn) win_submit(gp.s_dn);
+    win_submit(gp.s);   // the PCIe site runs while the CPU pool below works
     // stashed FILEG blobs -> their arena_adapt victim slots, on the CPU while the card runs the DMAs (both only read
     // the stash slot; the slot is not reissued before this call has returned)
     for (int b = 0; b < nfg; ++b)
@@ -5456,6 +5480,8 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         }
         launch(re, rp);
         ck(cudaEventRecord(gp.c_used[h], gp.s), "used");
+        win_submit(gp.s_cp);   // this half's copies and kernels run while the host waits for the next half's reads
+        win_submit(gp.s);
     }
     for (auto& t : readers) t.join();
     const int64_t n_file = (int64_t) nF;

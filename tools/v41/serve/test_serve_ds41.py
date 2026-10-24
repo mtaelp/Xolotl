@@ -123,6 +123,36 @@ def t_parser():
     esc = "a&lt;" + D.P_CLOSE[1:] + "b"
     check("DwarfStar escape undone", D.unescape(esc) == "a" + D.P_CLOSE + "b", D.unescape(esc))
     t_parser_stream(calls)
+    t_parser_think_calls()
+
+
+def t_parser_think_calls():
+    """A DSML call written inside the thinking is the call when only whitespace, `</think>` or the end of the turn
+    follows it; quoted mid-line, followed by more thinking, or cut by max tokens it stays reasoning text."""
+    tools = [t["function"] for t in TOOLS]            # the server's flattened list
+    call = ("read_file", {"path": "room.js", "lines": 40})
+    inv = dsml([call]).strip()
+    end = E.thinking_end_token
+    cases = [("then </think>", "I'll read the file.\n" + inv + "\n" + end, None, [call]),
+             ("then end of turn", "I'll read the file.\n" + inv + "\n", None, [call]),
+             ("cut by max tokens", "I'll read the file.\n" + inv + "\n", "length", []),
+             ("more thinking after it", "Maybe:\n" + inv + "\nNo, first list the dir." + end + "ok", None, []),
+             ("quoted mid-line", "The form is " + inv.split("\n", 1)[1] + " and so on." + end + "ok", None, [])]
+    for label, text, reason, want in cases:
+        bad = []
+        for stream in (False, True):
+            for split in range(1, 40):
+                p = F.OutputParser(thinking=True, tools=tools, stream_tools=stream)
+                ev = []
+                for i in range(0, len(text), split):
+                    ev += p.feed(text[i:i + split])
+                ev += p.finish(reason)
+                got = [(e.call.name, e.call.arguments) for e in ev if e.kind == "tool_call"]
+                reasoning = "".join(e.text for e in ev if e.kind == "reasoning")
+                leaked = want and D.INVOKE_OPEN in reasoning
+                if got != want or leaked:
+                    bad.append((stream, split, got, reasoning[-120:]))
+        check(f"DSML call inside the thinking, {label}: {'call' if want else 'reasoning'}", not bad, bad[:1])
 
 
 def t_parser_stream(calls):

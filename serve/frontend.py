@@ -834,6 +834,11 @@ def json_tool_call(body: str, schemas: dict) -> ToolCall | None:
     return ToolCall(name=obj["name"], arguments=args) if isinstance(args, dict) else None
 
 
+def call_name(body: str) -> str:
+    """The tool name a call body opens with (`<function=NAME>`); a model with another call form replaces this."""
+    return body.strip()[len("<function="):].split(">", 1)[0].strip()
+
+
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     """`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>` -> ToolCall. Values are JSON-decoded
     when the tool's schema says the parameter is not a string (or, without a schema, when they parse as JSON
@@ -1170,7 +1175,7 @@ class OutputParser:
                 if end >= 0 and (think < 0 or think >= end):
                     call = None
                     try:
-                        name = body[:end].strip()[len("<function="):].split(">", 1)[0].strip()
+                        name = call_name(body[:end])
                         if name in self.schemas:
                             call = parse_tool_call(body[:end], self.schemas.get(name))
                     except ValueError:

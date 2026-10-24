@@ -345,6 +345,9 @@ F.CALL_START, F.CALL_END = INVOKE_OPEN, INVOKE_CLOSE
 F.FUNC_START = ""
 F.call_end = ds41_call_end
 F.parse_tool_call = ds41_parse_tool_call
+# 2026-10-24: a call written inside the thinking (#804's rescue) is read by name first; the frontend's default reads
+# `<function=NAME>`, so a DSML call there was never recognized and the turn ended with the call lost in the reasoning.
+F.call_name = lambda body: (re.match(r'\s*name="(.*?)">', body, re.DOTALL) or [None, None])[1]
 # frontend.forced_call writes the forced-call (tool_choice) prefix in Qwen's `<function=NAME>` shape; V4.1's
 # DSML puts the name in the call OPENER itself, so a forced call has to be written in that shape here.  It opens the
 # calls block first, as the encoder writes one (a bare invoke without it: the model drifted back to text).

@@ -868,3 +868,31 @@ Checks:
 
 Separately, the Harness profile's `xolot` provider has `streamIdleTimeoutMs: 1800000` (in
 `~/.dsh/profiles/desktop/cordis.patch.yml`; Harness needs a restart to pick it up).
+
+## Tool calls written inside the thinking (2026-10-24)
+
+DeepSeek sometimes writes its DSML call before it closes its thinking. The frontend already rescues such a call (#804:
+it is the call when only whitespace, `</think>` or the end of the turn follows it, and it stays reasoning text when it
+is quoted mid-line or in code, followed by more thinking, or cut by max tokens). It read the tool's name as Qwen's
+`<function=NAME>`, so a DSML call never matched a declared tool and the turn ended with the call lost in the reasoning.
+`frontend.call_name` is now the hook, and `serve_ds41.py` reads DSML's ` name="X">` with it. `test_serve_ds41.py`
+covers the five cases at every split 1..39, with and without stream_tools; the frontend's own parser tests still pass.
+
+## Windows submit flush: measured, left off (2026-10-24)
+
+Strata's engine queries the stream after queuing GPU work (`win_submit`), because WDDM may hold queued work until the
+host waits on it. The same is in `ds41_moe.cpp` behind `DS41_WIN_SUBMIT=1` (default off): after the decode's VRAM-hit
+and PCIe launches, the verify path's hit and PCIe sites, and each half of the prefill's streamed experts. Same PC,
+fresh server per run, `bench_long.py` (prefill / decode tok/s):
+
+| run | 8K | 16K | 32K | warm 8K | follow-up on 32K |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ours, off, run 1 | 522 / 31.9 | 656 / 28.9 | 782 / 24.5 | 525 / 28.1 | 172 / 27.4 |
+| ours, on, run 1 | 526 / 31.1 | 656 / 30.7 | 775 / 27.0 | 498 / 30.2 | 163 / 27.8 |
+| ours, off, run 2 | 521 / 33.5 | 647 / 31.0 | 798 / 31.9 | 535 / 31.4 | 191 / 29.3 |
+| ours, on, run 2 | 507 / 33.5 | 664 / 30.2 | 684 / 22.9 | 414 / **3.6** | 126 / 25.5 |
+| ISTA, off | 429 / 45.2 | 666 / 41.3 | 762 / 38.0 | 528 / 41.2 | 199 / 27.0 |
+| ISTA, on | 443 / 38.7 | 662 / 32.9 | 694 / 20.6 | 478 / 32.4 | 146 / **10.6** |
+
+No gain in any run, and both runs with it on slowed down as the run went on (the expert hit counts were the same as
+the others, so the time went to waiting, not to more SSD reads). It stays off.
