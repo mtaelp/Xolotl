@@ -796,3 +796,37 @@ back as text. `serve_ds41.py` now opens it the way DeepSeek's encoder writes one
 `<｜DSML｜ invoke name="NAME">`). Checked live: OpenAI named (thinking off) and `required` (thinking on), Anthropic
 `tool` and `any` all return a parsed tool call; `test_serve_ds41.py` passes. With a named tool the model may add a
 second call after the forced one in the same block.
+
+## Tool calls stream as they are written (2026-10-24)
+
+DeepSeek Harness (it runs pi-ai) dropped long agent turns twice in a row, at 527 s and 636 s: each one was a
+tool call that wrote a whole file of about 1,000 lines (~10k tokens). The engine was still generating at 30 tok/s and
+the server log says `finish cancel` (the client closed the connection). The cause was on both sides:
+
+- The server held a DSML tool call back until its `</｜DSML｜ invoke>`, because the frontend's streaming scanner only
+  reads Qwen's `<function=...>` body (`serve_ds41.py` turned `stream_tools` off). During a long file write a client
+  saw only keep-alives for minutes.
+- pi-ai's `streamIdleTimeoutMs` (default 300 s) is reset only by a stream event its parser produces. An empty-delta
+  chunk (the keep-alive event above) produces none, so it does not reset the timer.
+
+`serve_ds41.py` now has a DSML scanner (`_scan_ds41`) and leaves `stream_tools` on. It sends the same events as the
+frontend's: `tool_start` once the name is known, then the JSON arguments in pieces (string values as they arrive,
+other types whole once complete). The server never resends a streamed call's arguments, so the joined pieces must
+equal `ds41_parse_tool_call`'s result, including the `&lt;` escape of a value's own closing tag. A piece never
+splits an escape or a closing tag.
+
+Checks:
+
+- `test_serve_ds41.py`, with a new test: the joined pieces equal the final arguments at every split from 1 to 59
+  characters, including escapes, newlines and non-ASCII characters. All passed, HTTP tests included.
+- `serve/test_server.py` and `test_frontend.py`: 349 OK.
+- Forced `tool_choice`: 4/4.
+- Live, one streamed `write_file` call per API:
+
+| API | arg pieces | longest gap between chunks with content | file |
+|---|---|---|---|
+| OpenAI | 2,135 | 5.6 s | game.js, 8,630 chars |
+| Anthropic | 1,692 | 6.3 s | game.js, 6,369 chars |
+
+Separately, the Harness profile's `xolot` provider has `streamIdleTimeoutMs: 1800000` (in
+`~/.dsh/profiles/desktop/cordis.patch.yml`; Harness needs a restart to pick it up).

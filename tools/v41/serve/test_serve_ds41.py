@@ -122,6 +122,41 @@ def t_parser():
     check("non-DSML text passes through", c == "plain answer <｜DSML not a tag" and not k, (c, k))
     esc = "a&lt;" + D.P_CLOSE[1:] + "b"
     check("DwarfStar escape undone", D.unescape(esc) == "a" + D.P_CLOSE + "b", D.unescape(esc))
+    t_parser_stream(calls)
+
+
+def t_parser_stream(calls):
+    """stream_tools (the server's mode): tool_start + tool_args pieces arrive while the call is written, and the joined
+    pieces of each call are its final arguments (the server does not resend them)."""
+    calls = calls + [("read_file", {"path": "line 1\n  line 2 é \U0001F600\n", "lines": None,
+                                    "body": "x &lt;" + D.P_CLOSE[1:] + " &amp;lt;" + D.P_CLOSE[1:] + " & &amp; <｜DSML"})]
+    text = "think" + E.thinking_end_token + "Writing." + dsml(calls)
+    bad, early = [], True
+    for split in range(1, 60):
+        p = F.OutputParser(thinking=True, tools=TOOLS, stream_tools=True)
+        ev, args, final, before_end = [], {}, [], 0
+        for i in range(0, len(text), split):
+            got = p.feed(text[i:i + split])
+            ev += got
+            if i + split < len(text) - len(D.INVOKE_CLOSE) and any(e.kind == "tool_args" for e in got):
+                before_end += 1
+        ev += p.finish()
+        for e in ev:
+            if e.kind == "tool_args":
+                args[e.call.id] = args.get(e.call.id, "") + e.text
+            elif e.kind == "tool_call":
+                final.append(e.call)
+        try:
+            streamed = [(c.name, json.loads(args[c.id])) for c in final]
+        except (KeyError, ValueError) as err:
+            streamed = repr(err)
+        want = [(n, D.ds41_parse_tool_call(f' name="{n}">\n' + dsml([(n, a)]).split(f' name="{n}">\n', 1)[1]).arguments)
+                for n, a in calls]
+        if streamed != want or [(c.name, c.arguments) for c in final] != want:
+            bad.append((split, streamed, want))
+        early &= before_end > 0
+    check("DSML stream_tools: joined tool_args == final arguments at every split 1..59", not bad, bad[:1])
+    check("DSML stream_tools: arguments arrive before the call ends", early)
 
 
 def t_tokenizer(tok_dir):

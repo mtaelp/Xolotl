@@ -371,8 +371,7 @@ WRAPPERS = (CALLS_OPEN, CALLS_CLOSE)
 
 
 def _op_init_ds41(self, *a, **k):
-    _op_init(self, *a, **k)
-    self.stream_tools = False          # the streaming scanner reads Qwen's <function=...> body
+    _op_init(self, *a, **k)            # stream_tools as the server asks: _scan_ds41 below reads the DSML body
     self.dsml_hold = ""
     self.echo_check, self.echo_hold = True, ""
 
@@ -430,6 +429,89 @@ def _op_finish_ds41(self, *a, **k):   # *a/**k: the 0.1.44 server's finish(reaso
     return out
 
 
+# 2026-10-24: stream_tools for DSML.  The frontend's scanner reads Qwen's `<function=...>` body, so this server used to
+# hold a call back until its </｜DSML｜ invoke>; a long file write then sent nothing but keep-alives for minutes, and
+# pi-ai (DeepSeek Harness) dropped the stream at its 300 s idle timeout - it never counts an empty delta.  This scanner
+# reports the call as it is written, the same events as the frontend's (tool_start, then tool_args JSON pieces), and its
+# pieces join to exactly what ds41_parse_tool_call returns: the server does not resend a streamed call's arguments.
+_NAME_RE = re.compile(r'\s*name="(.*?)">', re.DOTALL)
+_PATTR_RE = re.compile(r' name="(.*?)" string="(true|false)">', re.DOTALL)
+_ESC_TAIL = "lt;" + P_CLOSE[1:]
+
+
+def _esc_hold(text: str) -> int:
+    """Length of the tail of `text` that may still become an escaped closing tag (see unescape): held so a piece
+    never splits one."""
+    i = text.rfind("&")
+    if i < 0:
+        return 0
+    r = text[i + 1:]
+    while r.startswith("amp;"):
+        r = r[4:]
+    return len(text) - i if "amp;".startswith(r) or (_ESC_TAIL.startswith(r) and r != _ESC_TAIL) else 0
+
+
+def _scan_ds41(self) -> list:
+    """Advance the streaming view of the DSML call body in self.buf (` name="X">` then its parameters)."""
+    out = []
+
+    def args(s):
+        if s:
+            out.append(F.Event("tool_args", s, call=self.scall))
+    while True:
+        rest = self.buf[self.sp:]
+        if self.ss == "name":
+            m = _NAME_RE.match(rest)
+            if not m:
+                return out
+            self.scall = F.ToolCall(name=m.group(1), arguments={})
+            out.append(F.Event("tool_start", call=self.scall))
+            args("{")
+            self.sp += m.end()
+            self.ss = "between"
+        elif self.ss == "between":
+            stripped = rest.lstrip()
+            self.sp += len(rest) - len(stripped)
+            m = _PATTR_RE.match(stripped, len(P_OPEN)) if stripped.startswith(P_OPEN) else None
+            if not m:
+                return out              # a tag still arriving (or trailing text): wait
+            args(("" if self.sfirst else ",") + json.dumps(m.group(1)) + ":")
+            self.sfirst = False
+            self.sp += m.end()
+            if m.group(2) == "true":
+                args('"')
+                self.ss = "str"
+            else:
+                self.ss = "raw"
+        elif self.ss == "str":
+            end = rest.find(P_CLOSE)
+            if end >= 0:
+                args(json.dumps(unescape(rest[:end]))[1:-1] + '"')
+                self.sp += end + len(P_CLOSE)
+                self.ss = "between"
+                continue
+            safe = len(rest) - max(_esc_hold(rest), self._hold(rest, (P_CLOSE,)))
+            if safe > 0:
+                args(json.dumps(unescape(rest[:safe]))[1:-1])
+                self.sp += safe
+            return out
+        elif self.ss == "raw":
+            end = rest.find(P_CLOSE)
+            if end < 0:
+                return out
+            value = unescape(rest[:end])
+            try:
+                v = json.loads(value)
+            except ValueError:
+                v = value
+            args(json.dumps(v, ensure_ascii=False))
+            self.sp += end + len(P_CLOSE)
+            self.ss = "between"
+        else:
+            return out
+
+
+F.OutputParser._scan = _scan_ds41
 F.OutputParser.__init__ = _op_init_ds41
 F.OutputParser.feed = _op_feed_ds41
 F.OutputParser.finish = _op_finish_ds41
