@@ -2544,6 +2544,120 @@ class CancelledRead(unittest.TestCase):
         self.assertEqual(m["totals"]["prompt_tokens"], 8 + 2 * total)
 
 
+class SlowPrepareKeepalive(unittest.TestCase):
+    """A streamed request whose prepare (rendering + image encoding) outlasts EVENT_BEAT_S opens its stream early and
+    sends real events while it waits: pi lost a turn with 4 screenshots whose CPU encoding took minutes, the stream
+    still unopened (2026-10-24).  A quick prepare sends nothing early (a bad request stays a 400)."""
+
+    BEAT = 0.2
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.svc = Service(MockEngine(self.tok, "ok", max_context=CTX), self.tok,
+                           ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        self.beat = mock.patch("serve.server.EVENT_BEAT_S", self.BEAT)
+        self.beat.start()
+
+    def tearDown(self):
+        self.beat.stop()
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def slow_prepare(self, delay, error=None):
+        real = self.svc.prepare
+
+        def prepare(*a, **k):
+            time.sleep(delay)
+            if error:
+                raise error
+            return real(*a, **k)
+        return mock.patch.object(self.svc, "prepare", prepare)
+
+    def post(self, path, body):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, r.read().decode()
+
+    @staticmethod
+    def is_beat(c):   # an empty delta that is not the last chunk (that one carries finish_reason)
+        return c["choices"][0]["delta"] == {} and c["choices"][0]["finish_reason"] is None
+
+    def openai_body(self):
+        return {"model": "m", "stream": True, "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}
+
+    def anthropic_body(self):
+        return {"model": "m", "stream": True, "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}
+
+    def test_openai_beats_while_preparing(self):
+        with self.slow_prepare(5 * self.BEAT):
+            status, text = self.post("/v1/chat/completions", self.openai_body())
+        self.assertEqual(status, 200)
+        chunks = [json.loads(ln[6:]) for ln in text.splitlines() if ln.startswith("data: {")]
+        self.assertGreaterEqual(sum(1 for c in chunks if self.is_beat(c)), 2)
+        self.assertEqual(len({c["id"] for c in chunks}), 1)                       # one id throughout
+        self.assertEqual("".join(c["choices"][0]["delta"].get("content") or c["choices"][0]["delta"].get(
+            "reasoning_content") or "" for c in chunks), "ok")
+        self.assertTrue(text.rstrip().endswith("data: [DONE]"))
+
+    def test_anthropic_beats_while_preparing(self):
+        with self.slow_prepare(5 * self.BEAT):
+            status, text = self.post("/v1/messages", self.anthropic_body())
+        self.assertEqual(status, 200)
+        names = [ln[7:] for ln in text.splitlines() if ln.startswith("event: ")]
+        self.assertEqual(names.count("message_start"), 1)
+        self.assertEqual(names[0], "message_start")
+        self.assertGreaterEqual(names.count("ping"), 2)
+        self.assertEqual(names[-1], "message_stop")
+        delta = [json.loads(ln[6:]) for ln in text.splitlines() if ln.startswith("data: ") and "message_delta" in ln]
+        self.assertGreater(delta[0]["usage"]["input_tokens"], 0)
+
+    def test_a_failure_after_the_stream_opened_is_an_event(self):
+        with self.slow_prepare(3 * self.BEAT, ValueError("the image could not be read")):
+            status, text = self.post("/v1/chat/completions", self.openai_body())
+        self.assertEqual(status, 200)
+        self.assertIn("the image could not be read", text)
+        self.assertTrue(text.rstrip().endswith("data: [DONE]"))
+
+    def test_the_images_reach_the_engine(self):
+        """prepare keeps the request's image embeddings in a thread-local; run reads them on the request's thread.
+        Prepared on another thread they were lost: the engine got the image tokens without the pictures."""
+        real_prepare, real_run, seen = self.svc.prepare, self.svc.run, []
+
+        def prepare(*a, **k):
+            r = real_prepare(*a, **k)
+            self.svc.embeddings.path, self.svc.embeddings.keys = "emb.bin", ["k1"]
+            return r
+
+        def run(*a, **k):
+            seen.append((getattr(self.svc.embeddings, "path", None), getattr(self.svc.embeddings, "keys", None)))
+            return real_run(*a, **k)
+
+        for delay in (0.0, 3 * self.BEAT):            # a quick prepare and one that opened the stream early
+            seen.clear()
+            with mock.patch.object(self.svc, "prepare", prepare), mock.patch.object(self.svc, "run", run):
+                if delay:
+                    with self.slow_prepare(delay):
+                        self.post("/v1/chat/completions", self.openai_body())
+                else:
+                    self.post("/v1/chat/completions", self.openai_body())
+            self.assertEqual(seen, [("emb.bin", ["k1"])], delay)
+
+    def test_a_quick_failure_is_still_a_400(self):
+        with self.slow_prepare(0.0, ValueError("bad")):
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                self.post("/v1/chat/completions", self.openai_body())
+        self.assertEqual(e.exception.code, 400)
+
+    def test_a_quick_prepare_sends_nothing_early(self):
+        status, text = self.post("/v1/chat/completions", self.openai_body())
+        chunks = [json.loads(ln[6:]) for ln in text.splitlines() if ln.startswith("data: {")]
+        self.assertEqual(chunks[0]["choices"][0]["delta"], {"role": "assistant", "content": ""})
+        self.assertEqual(sum(1 for c in chunks if self.is_beat(c)), 0)
+
+
 class HeldBackArgKeepalive(unittest.TestCase):
     """#1666: with stream_tools a tool call's array or object argument is held until it is whole, so a big one
     left the stream silent for minutes while tokens were generated - a client's idle timeout (Forge's is 120 s)

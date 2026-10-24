@@ -767,6 +767,26 @@ already did this for Codex.
 
 `serve/test_server.py` (314 tests) and the keep-alive tests pass.
 
+### Long image requests (2026-10-24)
+
+A pi turn with 4 screenshots (18,129 image tokens, a 93K-token prompt) failed with "stream idle timeout after
+300000ms". The CPU encoder spent minutes on the pictures, using 8 cores the whole time. That happens in
+`Service.prepare`, before the response stream opened, so the client received nothing at all. Two changes:
+
+- `serve/server.py`: a streamed request's `prepare` runs on a worker thread. If it takes longer than `EVENT_BEAT_S`
+  (15 s), the stream opens and a real event goes out every 15 s until it is done (OpenAI: the role chunk, then empty
+  deltas with the same id; Anthropic: `message_start`, then `ping`). A failure after that point is sent as an error
+  event; a quick one is still a 400. `prepare` keeps the images' embeddings in a thread-local, so they are handed back
+  to the request's thread. The first version missed this, and its streamed image requests reached the engine without
+  the pictures (`images=0` in the engine log). Tests: `SlowPrepareKeepalive` in `serve/test_server.py`.
+- `strata-ds41-windows.json`: the image encoder runs on the 5090 with `"device": "cuda", "offload": true`
+  (`venv-vision` has `torch 2.14.1+cu130`). The weights stay in pinned RAM and are copied over per image. Text decode
+  is unchanged (see "Image encoder: CPU vs GPU").
+
+Checked live with both cards: 4 pictures of 1536x1152 (4,004 image tokens), streamed. The pictures were encoded and
+the answer came in 26-27 s. The longest gap between events was 10.6 s (OpenAI) and 17.7 s (Anthropic). The idle
+encoder now uses 0.00 cores.
+
 ## Forced tool_choice (2026-10-22)
 
 A forced `tool_choice` (OpenAI `required` / a named function, Anthropic `any` / `tool`) used to open the call as

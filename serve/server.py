@@ -4939,10 +4939,11 @@ def prompt_progress(svc: Service):
             "time_ms": int(getattr(engine, "progress_ms", 0) or 0)}
 
 
-def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, force=None):
+def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, force=None, head=None):
     """`run`: the events to send instead of Service.run's (run_with_mcp); its ("mcp", {...}) items become chunks with
-    an empty delta and a `strata_mcp` field, which only the web app reads.  `force`: see Service.run."""
-    cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
+    an empty delta and a `strata_mcp` field, which only the web app reads.  `force`: see Service.run.  `head`: the
+    id / created the stream already used (_early_prepare's events), so every chunk of it carries the same id."""
+    cid, created = (head["id"], head["created"]) if head else ("chatcmpl-" + uuid.uuid4().hex[:24], int(time.time()))
     model = svc.model_for(req)
     # llama.cpp's flag, and its default: a client that wants prompt progress asks for it, and nothing changes for one
     # that does not.  Strata already sends a keep-alive comment on every PP line, so this only fills that line in.
@@ -5071,11 +5072,18 @@ def structured_chunks(chunks, validator):
 
 
 # ------------------------------------------------------------------------------------------------ Anthropic
-def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None):
-    mid = "msg_" + uuid.uuid4().hex[:24]
-    yield "message_start", {"type": "message_start", "message": {
+def anthropic_start(svc: Service, req: dict, mid: str, input_tokens: int) -> dict:
+    return {"type": "message_start", "message": {
         "id": mid, "type": "message", "role": "assistant", "model": svc.model_for(req), "content": [],
-        "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": len(ids), "output_tokens": 0}}}
+        "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": input_tokens, "output_tokens": 0}}}
+
+
+def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None, started=False):
+    """`started`: the stream's message_start went out already (_early_prepare: before the prompt's token count was
+    known), so this does not send another."""
+    mid = "msg_" + uuid.uuid4().hex[:24]
+    if not started:
+        yield "message_start", anthropic_start(svc, req, mid, len(ids))
     index, open_kind, used_tool = -1, None, False
 
     def close():
@@ -6024,6 +6032,64 @@ def make_handler(svc: Service):
             self._cors()
             self.end_headers()
 
+        def _early_prepare(self, req, prepare, opener, beat, cancel):
+            """Runs `prepare` (Service.prepare: rendering, tokenizing and encoding the request's images - minutes for
+            several large pictures on a CPU encoder) for a streamed request without leaving its client in silence.
+            SDK clients (pi, the OpenAI / Anthropic SDKs) abort after an idle timeout (pi: 300 s), and nothing was sent
+            before prepare returned: pi lost a turn with 4 screenshots (18,129 image tokens) that way (2026-10-24).
+            Done within EVENT_BEAT_S (nearly every request): returns (result, False, None) and nothing has been sent, so
+            a bad request is still a 400.  Longer: the stream opens, `opener()` and then `beat()` every EVENT_BEAT_S
+            write real events until prepare returns -> (result, True, None), or (None, True, exc) when it raised (the
+            caller says so in the stream).  The client gone while waiting: (None, True, None) with `cancel` set."""
+            if not req.get("stream"):
+                return prepare(), False, None
+            box = {}
+            record = getattr(svc.request_trace, "record", None)
+
+            def work():
+                # prepare keeps per-request state in thread-locals: the monitor's record (read) and the images'
+                # embeddings file + keys (written; run() reads them on the request's own thread - without them the
+                # engine got the image tokens and no pictures)
+                svc.request_trace.record = record
+                try:
+                    box["r"] = prepare()
+                except BaseException as e:                   # noqa: BLE001 - handed to the request's thread
+                    box["e"] = e
+                box["emb"] = dict(vars(svc.embeddings))
+
+            def done():
+                for k, v in box.get("emb", {}).items():
+                    setattr(svc.embeddings, k, v)
+
+            t = threading.Thread(target=work, daemon=True, name="strata-prepare")
+            t.start()
+            t.join(EVENT_BEAT_S)
+            if not t.is_alive():
+                done()
+                if "e" in box:
+                    raise box["e"]
+                return box["r"], False, None
+            try:
+                self._sse()
+                opener()
+                self.wfile.flush()
+                while True:
+                    t.join(EVENT_BEAT_S)
+                    if not t.is_alive():
+                        break
+                    beat()
+                    self.wfile.flush()
+            except OSError:
+                self._note(outcome="disconnected")
+                cancel.set()
+                t.join()
+                return None, True, None
+            done()
+            if "e" in box:
+                print(f"[strata] the request failed after its stream opened: {box['e']}", flush=True)
+                return None, True, box["e"]
+            return box["r"], True, None
+
         def _capture(self, items, api):
             """Retain bounded input/output for the monitor without changing the API response (the items as they
             are when the monitor is off)."""
@@ -6132,18 +6198,40 @@ def make_handler(svc: Service):
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            head = {"id": "chatcmpl-" + uuid.uuid4().hex[:24], "object": "chat.completion.chunk",
+                    "created": int(time.time()), "model": svc.model_for(req)}
+
+            def early_chunk(delta):
+                c = {**head, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
+                self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
+
+            got, opened, exc = self._early_prepare(
+                req, lambda: svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel),
+                lambda: early_chunk({"role": "assistant", "content": ""}), lambda: early_chunk({}), cancel)
+            if opened and got is None:                       # failed (or the client left) after the stream opened
+                if exc is not None:
+                    kind = "invalid_request_error" if isinstance(exc, ValueError) else "server_error"
+                    err = {"error": {"type": kind, "message": str(exc)}}
+                    self._note(error=err["error"])
+                    try:
+                        self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                    except OSError:
+                        pass
+                return
+            ids, thinking, max_new = got
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
+            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force,
+                                   head=head if opened else None)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
-            self._sse()
-            last, head = time.monotonic(), None
+            if not opened:
+                self._sse()
+            last, head = time.monotonic(), (head if opened else None)
             try:
                 for c in chunks:
                     if c is None:
@@ -6370,13 +6458,36 @@ def make_handler(svc: Service):
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            mid = "msg_" + uuid.uuid4().hex[:24]
+
+            def early_event(name, e):
+                self.wfile.write(f"event: {name}\n".encode() + b"data: " + json.dumps(e, ensure_ascii=False).encode()
+                                 + b"\n\n")
+
+            # opened early, message_start goes out before the prompt's size is known: input_tokens 0 there, and
+            # message_delta gives the real counts at the end
+            got, opened, exc = self._early_prepare(
+                req, lambda: svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel),
+                lambda: early_event("message_start", anthropic_start(svc, req, mid, 0)),
+                lambda: early_event("ping", {"type": "ping"}), cancel)
+            if opened and got is None:
+                if exc is not None:
+                    kind = "invalid_request_error" if isinstance(exc, ValueError) else "api_error"
+                    err = {"type": "error", "error": {"type": kind, "message": str(exc)}}
+                    self._note(error=err["error"])
+                    try:
+                        self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+                    except OSError:
+                        pass
+                return
+            ids, thinking, max_new = got
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
-            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
+            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force, started=opened)
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
-            self._sse()
+            if not opened:
+                self._sse()
             last = time.monotonic()
             try:
                 for item in events:

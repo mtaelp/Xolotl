@@ -60,7 +60,9 @@
     "model": "H:/ai/xolot/models/1017/V41-GSQ-1017.gguf",
     "reference_dir": "H:/ai/xolot/dsv41-inference/inference",
     "threads": 8,
-    "gpu": false
+    "gpu": false,
+    "device": "cuda",
+    "offload": true
   },
   "model_name": "deepseek-v4.1-flash-strata-gsq",
   "log": "logs/strata-ds41.log",
