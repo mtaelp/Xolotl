@@ -53,6 +53,7 @@
 #include <limits>
 #include <string>
 #include <utility>
+#include <atomic>
 #include <mutex>
 #include <vector>
 
@@ -269,12 +270,24 @@ private:
     /// The buffered fd (unaligned fallback reads, the mirror's size check).  Windows opens it on first use only: an
     /// open buffered handle opened right after GgufModel's mapping keeps the file's cache state alive, and with it NTFS
     /// checks cache coherency on every unbuffered read (7.0 -> 3.4 GB/s for the whole run).  POSIX: opened in open().
-    int buffered_fd() const;
-    mutable int fd_ = -1;
-    mutable std::once_flag fd_once_;
+    int buffered_fd(size_t shard = 0) const;
     bool opened_ = false;
-    int dfd_ = -1;               ///< O_DIRECT twin of fd_ (-1 where the filesystem refused it)
+    int dfd_ = -1;               ///< shard 0's O_DIRECT twin (-1 where the filesystem refused it)
     size_t dalign_ = 0;          ///< read_inplace's alignment (dio::direct_align: Windows only), 0 = off
+    /// A split GGUF (`-0000k-of-0000N`, ISTA-DASLab's 4 shards): every offset below carries its shard in the top bits
+    /// (off >> kShardShift; 0 = the first file, so a single-file GGUF's offsets are the plain file offsets) and
+    /// sfd_ / sdfd_ hold each shard's fds (fd_ / dfd_ = shard 0's).  A blob's three spans each lie in one tensor, so in
+    /// one shard; a span's sub-range (read_part) keeps its tag.  sfd_ is buffered_fd()'s: on Windows a shard's buffered
+    /// handle is opened on its first use only, as the single file's always was.
+    static constexpr int kShardShift = 44;
+    std::vector<std::string> spath_;
+    mutable std::unique_ptr<std::atomic<int>[]> sfd_;
+    std::vector<int> sdfd_;
+    mutable std::mutex sfd_mu_;
+    bool direct_ok_ = false;     ///< every shard has its O_DIRECT twin
+    int sfd(uint64_t off) const { return buffered_fd((size_t) (off >> kShardShift)); }
+    int sdfd(uint64_t off) const { return sdfd_[(size_t) (off >> kShardShift)]; }
+    static uint64_t sloc(uint64_t off) { return off & ((1ull << kShardShift) - 1); }
     size_t scratch_ = 0;         ///< the aligned bounce one read_direct span needs
     Ds41MoeGeom g_;
     size_t max_ = 0;

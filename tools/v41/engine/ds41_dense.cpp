@@ -1,6 +1,7 @@
 // tools/v41/engine/ds41_dense.cpp - see ds41_dense.hpp.  Line references are to DeepSeek's inference/model.py.
 #include "ds41_io.hpp"
 #include "ds41_dense.hpp"
+#include "ds41_embd.hpp"
 
 #include "ds41_engram.hpp"
 #include "ds41_ops.hpp"
@@ -322,6 +323,8 @@ struct Ds41Dense::Impl {
     std::vector<float> host_xwts;
     long long rm_slots = 0, rm_swaps = 0, rm_rows = 0;
     double rm_kept = 0;
+    const uint8_t * embd = nullptr;       // token_embd rows on the mmap (embd_type: F16 ours, Q5_K ISTA's)
+    int embd_type = GGML_TYPE_F16;
     // ---- vision (DeepSeek-V4.1 image input): the request's image span rows, by absolute position.  When enabled,
     // set_vision() swaps in exp_probs_b_vl on those positions and
     // marks them DEAD for Engram.  Empty (n_vis = 0) for a text request.
@@ -330,8 +333,7 @@ struct Ds41Dense::Impl {
     const float * vis_rows = nullptr;     // n_vis * D floats, already in prompt order
     const int64_t * vis_pos = nullptr;    // n_vis ascending absolute prompt positions
     int n_vis = 0;
-    const uint8_t * embd = nullptr;       // token_embd F16 rows on the mmap (Windows + GPU: in embd_own)
-    std::vector<uint8_t> embd_own;
+    std::vector<uint8_t> embd_own;        // Windows + GPU: the token_embd rows, copied off the mmap (embd points here)
     std::vector<std::vector<float>> eng_rows;
     // The pass's Engram reads, started (async) by upload_inputs and waited at the first Engram layer's span /
     // attn_router: the whole pass's rows are read from disk while the embeddings, the init graph and the layers below
@@ -387,11 +389,32 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
     const GgufModel & model = *im.model;
     ggml_init_params ip = { 256ull * 1024 * 1024, nullptr, true };
     w.ctx = ggml_init(ip);
+    // the llama.cpp convention (ISTA-DASLab's GGUFs): its Engram names map to ours (ds41_canonical_name), its 3-D
+    // attn_output_a [OGD, OL, OG] is our 2-D [OGD, OG*OL] (the same bytes), and its BF16 tensors are converted at load
+    // to the type our file has there (fp32 router / Engram norms, F16 compressor / indexer) - BF16 is not an operand
+    // type of every op the graph runs on them.  Quantized matrices (Q5_K ...) stay as they are: ggml multiplies them.
+    const bool lc = ds41_is_llamacpp_gguf(model);
+    auto canon = [&](const TensorInfo & ti) { return lc ? ds41_canonical_name(ti.name) : ti.name; };
+    auto lc_type = [&](const TensorInfo & ti) -> int {   // -1 = keep the file's
+        if (!lc || (ggml_type) ti.type != GGML_TYPE_BF16) return -1;
+        const std::string n = canon(ti);
+        auto ends = [&](const char * x) { const size_t L = std::strlen(x); return n.size() >= L && n.compare(n.size() - L, L, x) == 0; };
+        return ends("ffn_gate_inp.weight") || ends("engram_q_norm.weight") || ends("engram_k_norm.weight") ? GGML_TYPE_F32 : GGML_TYPE_F16;
+    };
     auto make = [&](const TensorInfo & ti, int type = -1) {   // type: the in-memory type (default the file's)
         int64_t ne[GGML_MAX_DIMS] = { 1, 1, 1, 1 };
+        int nd = (int) ti.shape.size();
         for (size_t d = 0; d < ti.shape.size() && d < GGML_MAX_DIMS; ++d) ne[d] = (int64_t) ti.shape[d];
-        ggml_tensor * t = ggml_new_tensor(w.ctx, (ggml_type) (type >= 0 ? type : (int) ti.type), (int) ti.shape.size(), ne);
-        ggml_set_name(t, ti.name.c_str());
+        const std::string cn = canon(ti);
+        static const std::string oa = "attn_output_a.weight";
+        if (lc && nd == 3 && cn.size() >= oa.size() && cn.compare(cn.size() - oa.size(), oa.size(), oa) == 0) {
+            ne[1] *= ne[2];
+            ne[2] = 1;
+            nd = 2;
+        }
+        if (type < 0) type = lc_type(ti);
+        ggml_tensor * t = ggml_new_tensor(w.ctx, (ggml_type) (type >= 0 ? type : (int) ti.type), nd, ne);
+        ggml_set_name(t, cn.c_str());
         return t;
     };
     // routed experts never reach ggml (PTQ1_0 = 143 is past GGML_TYPE_COUNT); the I32 maps are read by the geometry
@@ -420,12 +443,12 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
             w.bufs.push_back(buf);
             for (const auto & ti : ts) {
                 if (skip(ti.name)) continue;
-                ggml_tensor * t = make(ti);
+                ggml_tensor * t = make(ti, (int) ti.type);   // (bound in place: the file's own type)
                 if (ggml_backend_tensor_alloc(buf, t, const_cast<uint8_t *>(sh.tensor_data(ti))) != GGML_STATUS_SUCCESS) {
                     err = "cannot bind " + ti.name;
                     return false;
                 }
-                w.t[ti.name] = t;
+                w.t[canon(ti)] = t;
             }
         }
     } else {
@@ -460,7 +483,7 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
         for (size_t s = 0; s < model.size(); ++s)
             for (const auto & ti : model.shard(s).tensors()) {
                 if (skip(ti.name)) continue;
-                w.t[ti.name] = make(ti, requant(ti) ? (int) rq : -1);
+                w.t[canon(ti)] = make(ti, requant(ti) ? (int) rq : -1);
                 if (const std::string pn = pred_name(ti); !pn.empty()) {
                     ggml_tensor * tp = make(ti, (int) pq);
                     ggml_set_name(tp, pn.c_str());
@@ -484,7 +507,7 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
                 for (const auto & ti : model.shard(s).tensors()) {
                     if (skip(ti.name)) continue;
                     if (const std::string pn = pred_name(ti); !pn.empty()) want += ggml_nbytes(w.t[pn]);
-                    if ((int) w.t[ti.name]->type != (int) ti.type) want += ggml_nbytes(w.t[ti.name]);
+                    if ((int) w.t[canon(ti)]->type != (int) ti.type) want += ggml_nbytes(w.t[canon(ti)]);
                 }
             struct stat st {};
             const std::string mp = model.shard(0).path();
@@ -543,7 +566,7 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
         for (size_t s = 0; s < model.size(); ++s)
             for (const auto & ti : model.shard(s).tensors()) {
                 if (skip(ti.name)) continue;
-                ggml_tensor * t = w.t[ti.name];
+                ggml_tensor * t = w.t[canon(ti)];
                 const uint8_t * src = model.shard(s).tensor_data(ti);
                 if (const std::string pn = pred_name(ti); !pn.empty()) {
                     convert_upload(w.t[pn], ti, src);
@@ -557,7 +580,10 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
                 ++rq_n;
                 rq_from += (size_t) ggml_nrows(t) * ggml_row_size((ggml_type) ti.type, t->ne[0]);
             }
-        if (rq_n) std::fprintf(stderr, "dense requant: %zu Q8_0 matrices -> %s, %.2f -> %.2f GB%s\n", rq_n, ggml_type_name(rq),
+        if (rq_n && rq == GGML_TYPE_COUNT)   // requant off: only type conversions (a llama.cpp GGUF's BF16 -> F32 / F16)
+            std::fprintf(stderr, "dense convert: %zu matrices to the engine's types, %.2f -> %.2f GB\n", rq_n, rq_from / 1e9,
+                         rq_to / 1e9);
+        else if (rq_n) std::fprintf(stderr, "dense requant: %zu Q8_0 matrices -> %s, %.2f -> %.2f GB%s\n", rq_n, ggml_type_name(rq),
                                rq_from / 1e9, rq_to / 1e9, rq_in ? " (from the cache)" : rq_out ? " (cache written)" : "");
         if (rq_in) std::fclose(rq_in);
         if (rq_out) {
@@ -568,7 +594,9 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
     }
     size_t si = 0;
     const TensorInfo * te = model.find("token_embd.weight", &si);
+    if (!strata::v41::ds41_embd_type_ok((int) te->type)) { err = "token_embd type has no row reader"; return false; }
     im.embd = model.shard(si).tensor_data(*te);
+    im.embd_type = (int) te->type;
     return true;
 }
 
@@ -1726,8 +1754,8 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     // weights to the mapping and keeps it.
     if (!im.cpu) {
         const TensorInfo * te = im.model->find("token_embd.weight");
-        if (!te || te->type != GGML_TYPE_F16 || te->shape.size() < 2) { err = "token_embd.weight must be F16 [n_embd, n_vocab]"; return false; }
-        const size_t eb = (size_t) te->shape[0] * (size_t) te->shape[1] * 2;
+        if (!te || te->shape.size() < 2) { err = "token_embd.weight must be [n_embd, n_vocab]"; return false; }
+        const size_t eb = ggml_row_size((ggml_type) im.embd_type, te->shape[0]) * (size_t) te->shape[1];   // F16 or a quant type
         im.embd_own.assign(im.embd, im.embd + eb);
         im.embd = im.embd_own.data();
         im.model.reset();
@@ -2053,8 +2081,7 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
     im.host_emb.resize((size_t) (D * n));
     for (int t = 0; t < n; ++t) {
         if (tids[t] < 0 || tids[t] >= im.g.vocab) { im.err = "token id out of range"; return false; }
-        const uint16_t * row = reinterpret_cast<const uint16_t *>(im.embd) + (size_t) tids[t] * (size_t) D;
-        for (int64_t i = 0; i < D; ++i) im.host_emb[(size_t) (t * D + i)] = ggml_fp16_to_fp32(row[i]);
+        strata::v41::ds41_embd_row(im.embd, im.embd_type, D, tids[t], im.host_emb.data() + (size_t) (t * D));
     }
     // vision: overwrite the image span positions with the encoder's rows (model.py merge_image_embeddings) and mark
     // them, so the router picks exp_probs_b_vl there and Engram skips them.  vis_pos is ascending, the pass contiguous.
@@ -2201,8 +2228,7 @@ bool Ds41Dense::Impl::upload_rows(const Ds41Dense::Row * rows, int n) {
     im.host_emb.resize((size_t) (D * n));
     for (int t = 0; t < n; ++t) {
         if (rows[t].tid < 0 || rows[t].tid >= im.g.vocab) { im.err = "token id out of range"; return false; }
-        const uint16_t * row = reinterpret_cast<const uint16_t *>(im.embd) + (size_t) rows[t].tid * (size_t) D;
-        for (int64_t i = 0; i < D; ++i) im.host_emb[(size_t) (t * D + i)] = ggml_fp16_to_fp32(row[i]);
+        strata::v41::ds41_embd_row(im.embd, im.embd_type, D, rows[t].tid, im.host_emb.data() + (size_t) (t * D));
     }
     ggml_backend_tensor_set(im.i_emb, im.host_emb.data(), 0, im.host_emb.size() * 4);
     if (im.vision && im.i_img) {   // text rows only

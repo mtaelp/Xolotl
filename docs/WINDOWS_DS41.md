@@ -3,6 +3,44 @@
 The DeepSeek-V4.1 engine (`tools/v41/engine`, `ds41_generate`) was Linux-only. These changes make it build and run
 natively on Windows 10/11 with an NVIDIA card. There is no WSL step.
 
+## Fourth merge with upstream main (2026-10-24)
+
+Upstream `e9d0826` added 15 commits. The main one loads ISTA-DASLab's GSQ-RCO GGUFs, which are split into 4 files.
+`Ds41FileBlobs` now tags each offset with its shard and keeps per-shard file handles. The merge keeps this branch's
+Windows read rules for every shard:
+
+- Every shard gets its unbuffered (`FILE_FLAG_NO_BUFFERING`) handle at open. A shard's buffered handle opens on its
+  first use only, as the single file's did, because a live buffered handle makes NTFS check cache coherency on every
+  unbuffered read of that file. `advise` does nothing on Windows: `posix_fadvise` is a no-op there, and calling it
+  would open the buffered handles. Linux opens them all at once, as upstream does.
+- In-place aligned reads (`read_inplace`) go through the shard's unbuffered handle. The alignment is the largest any
+  shard needs.
+- The blob mirror stays single-file. A split GGUF logs `blob mirror: NOT used` (upstream's rule).
+- The Windows copy of the `token_embd` rows (it lets the engine drop the model mapping) works for any row type, not
+  only F16. ISTA's is Q5_K.
+
+Not tested: an actual split GGUF. The ISTA files (138-155 GB) are not on this PC. Our single-file path was
+benchmarked unchanged. Upstream e1b3931 now skips the dummy prefetch DMA by default. The same build, with and without
+`STRATA_PF_NO_DUMMY=0`, both cards, alternating runs:
+
+| | prefill 8K cold / 16K / warm 8K (tok/s) | decode (tok/s) |
+| --- | ---: | ---: |
+| new default (no dummy DMA) | 361 / 506 / 443 (first start after the build, cold file cache), 515 / 667 / 506 | 27.9-31.1 |
+| `STRATA_PF_NO_DUMMY=0` | 503 / 659 / 526, 512 / 665 / 529 | 27.7-32.1 |
+
+Within noise, so it stays on upstream's default. The numbers match this branch before the merge (523-526 /
+679-680 / 539-542, "`--gpu2` vs upstream's helper").
+
+Checks after the merge, both cards: `test_serve_ds41.py` all passed, `serve/test_server.py` 324 OK, frontend / vision /
+keep-alive / image tests OK, forced `tool_choice` 4/4, `check_api.py` PASS. Streamed `write_file` call: PASS on
+OpenAI (2,113 pieces, longest gap 6.2 s) and Anthropic (2,065, 5.5 s). A 114.6K-token chat with a side call: turn 1
+read at 656 tok/s, then 114,578 (pool) / 114,715 / 114,847 tokens reused on turns 2-4 (4.1-4.3 s).
+
+A correction to "Long image requests": pi-ai's idle timer is reset only by a chunk its parser turns into an event,
+and an empty delta is not one (see "Tool calls stream as they are written"). The early keep-alive events help
+clients that count any event. For pi-ai, what keeps a long image request alive is the GPU encoder (seconds, not
+minutes) and the Harness profile's `streamIdleTimeoutMs`.
+
 ## Third merge with upstream main (2026-10-23)
 
 Upstream `08e28a0` added 13 commits. Most of them are upstream's own versions of what this branch already does on
