@@ -10,7 +10,7 @@ Windows:
 
 | upstream | ours | kept |
 | --- | --- | --- |
-| `STRATA_DS41_REMOTE`: routed experts on a second GPU in a helper process (opt-in) | `--gpu2` | both. `--gpu2` stays in the config. The counters share `st.remote`, and the log names whichever is on. Not compared yet: the 3090 was not detected after the reboot. |
+| `STRATA_DS41_REMOTE`: routed experts on a second GPU in a helper process (opt-in) | `--gpu2` | both. `--gpu2` stays in the config (faster prefill, see below). The counters share `st.remote`, and the log names whichever is on. |
 | `STRATA_SERVE_REWIND1=1`: resume 1 token before the snapshot (opt-in) | `restore_to`: up to 16 back, on by default, also counted in the pool's choice | both. Ours runs first, so theirs only matters with ours declining. |
 | `STRATA_ARENA_SLICE_GIB` (opt-in) and a 32 GiB pin cap for `--remote-device` under WDDM | automatic 4 GiB fallback pieces | ours by default. Theirs when the env var is set or the cap applies. |
 | blob mirror with a buffered model file; whole-blob prompt reads (`read_staged`) from the mirror; `STRATA_BLOB_MIRROR_PART_SHARE` | mirror with unbuffered reads in place | merged: ours for `read_part`, theirs for `read_staged` and the share split |
@@ -26,6 +26,28 @@ two alternating runs of each exe):
 
 Warm 8K is 11% faster in both pairs. That matches the prompt's whole-blob reads now also coming from the mirror. Decode
 is unchanged.
+
+### `--gpu2` vs upstream's helper (2026-10-24, both cards)
+
+Fresh server per run, same bench, the config's CPU image encoder. The helper (`ds41_helper` on the 3090,
+`--skip-gib 18.5 --gib 19`, 2,005 experts) is set to the same share `--gpu2` takes (2,274 experts, 19.7 GiB). It ran
+with `STRATA_D3_DMA_STREAM=1`, as upstream's measurements did. Two rounds, the second in reverse order:
+
+| | prefill 8K cold / 16K / warm 8K (tok/s) | decode (tok/s) | ms per verify pass |
+| --- | ---: | ---: | ---: |
+| 5090 alone | 439 / 581 / 456 | 25.5-29.2 | 92-102 |
+| `STRATA_DS41_REMOTE` helper | 378 / 509 / 430, 487 / 643 / 501 | 29.1-32.7 | 79-88 |
+| `--gpu2 1` (the config) | 526 / 680 / 542, 523 / 679 / 539 | 30.2-33.5 | 78-88 |
+| `--gpu2 1` + `STRATA_D3_DMA_STREAM=1` | 510 / 660 / 528, 525 / 679 / 542 | 31.2-34.8 | 77-84 |
+
+Decode is a tie: both take the same verify-pass time off the 5090 alone. In the prompt, `--gpu2` is 5-30% faster. Why was not
+profiled (`STRATA_DS41_REMOTE_PROF` was off). One candidate: upstream's doc says the helper declines a chunk when its
+entries are more than half of the chunk's, and `--gpu2`'s worker has no such limit.
+
+With both cards and the config: forced `tool_choice` 4/4, `check_api.py` PASS, keep-alive (Anthropic) with the
+longest gap between events 24.8 s. A 113.8K-token chat with a side call: turn 1 read at 690 tok/s (164.9 s), then
+113,810 (pool) / 113,961 / 114,098 tokens reused on turns 2-4, in about 4.0 s each. `STRATA_D3_DMA_STREAM=1` changes nothing measurable with `--gpu2`. The config stays
+as it was.
 
 Checks: `test_serve_ds41.py` all passed, `serve/test_server.py` 318 OK, forced `tool_choice` 4/4, `check_api.py`
 PASS, keep-alive longest gap between events 20.1 s on both APIs. A 113.5K-token chat with a side call after turn 1
