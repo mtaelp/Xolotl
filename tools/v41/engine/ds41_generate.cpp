@@ -107,6 +107,8 @@ struct Args {
                                   // ~4x decode; 4096-tok ppl code 2.38 -> 2.67, agentic 15.1 -> 6.9; --route-bias 0 = exact routing)
     std::vector<std::string> engram;
     std::string engram_hot;
+    std::string cvec;             // --cvec FILE: a control vector projected out of the layers' outputs (Ds41DenseConfig::cvec)
+    float cvec_alpha = 0.5f;      // --cvec-alpha X: its strength at start; a request's cvec=X sets it (0 = off)
     int n_predict = 64;
     std::string backend = "cuda", experts = "gpu";
     int64_t slots = 0;            // 0 = auto (free VRAM after the dense half, minus --vram-margin)
@@ -299,6 +301,8 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--gpu2-skip") { const std::string v = next(); a.gpu2_skip = v == "auto" ? -1.0 : std::atof(v.c_str()); }
         else if (k == "--image-token") a.image_token = std::atoi(next().c_str());
         else if (k == "--vision") a.vision = true;
+        else if (k == "--cvec") a.cvec = next();
+        else if (k == "--cvec-alpha") a.cvec_alpha = (float) std::atof(next().c_str());
         else if (k == "--conversation-cache-mib") a.conv_mib = std::max(0, std::atoi(next().c_str()));
         else if (k == "--conversation-cache-slots") a.conv_slots = std::max(1, std::atoi(next().c_str()));
         else if (k == "--batch-slots" || k == "--batch") { const std::string v = next(); a.batch_slots = v == "auto" ? 0 : std::max(1, std::atoi(v.c_str())); }
@@ -574,6 +578,8 @@ int main(int argc, char ** argv) {
     dc.engram_dirs = a.engram;
     dc.engram_hot = a.engram_hot;
     dc.vision = a.vision;
+    dc.cvec = a.cvec;
+    dc.cvec_alpha = a.cvec_alpha;
     dc.engram_hot = a.engram_hot;
     dc.act_quant = a.act_quant;
     // --kv-fp4 / STRATA_KV_FP4=1: the compressed KV + indexer keys packed to their exact FP4 grids (Ds41DenseConfig::kv_fp4)
@@ -1768,6 +1774,7 @@ int main(int argc, char ** argv) {
         std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld", ctxv, (long long) resid_all, (long long) arena_all);
         if (pool_on) std::printf(" conversation_cache_mib=%d conversation_cache_slots=%d", a.conv_mib, a.conv_slots);
         if (NS > 0) std::printf(" batch_slots=%d slot_cache=1", NS);   // serve/server.py: the slot protocol (generate_batched)
+        if (dense.has_cvec()) std::printf(" cvec=%s", dense.cvec_info().c_str());   // the web app's per-chat switch
         std::printf("\n");
         if (pool_on) std::fprintf(stderr, "serve: conversation pool %d MiB, %d slots, records >= %d tokens\n", a.conv_mib,
                                   a.conv_slots, std::max(1, park_min));
@@ -1785,6 +1792,8 @@ int main(int argc, char ** argv) {
         auto env_rank = [](const char * k) { const char * e = std::getenv(k); return e ? std::max(0, std::atoi(e)) : 0; };
         const int cfg_rprot = env_rank("STRATA_RB_PROTECT"), cfg_rpool = env_rank("STRATA_RB_POOL");
         int cur_rprot = cfg_rprot, cur_rpool = cfg_rpool;
+        // the control vector's strength (cvec=, the server's "uncensor"): a request that does not name it gets --cvec-alpha
+        const float cfg_cvec = dense.cvec_alpha();
         static const bool rewind1 = std::getenv("STRATA_SERVE_REWIND1") && std::getenv("STRATA_SERVE_REWIND1")[0] == '1';
         std::string line;
         bool previous_vision = false;
@@ -2183,6 +2192,7 @@ int main(int argc, char ** argv) {
             float temp = a.temp, top_p = 1.0f, min_p = 0.0f;
             float req_rb = cfg_route_bias, req_rbf = cfg_route_bias_file, req_rbr = cfg_route_bias_remote;
             int req_rprot = cfg_rprot, req_rpool = cfg_rpool;
+            float req_cvec = cfg_cvec;
             std::vector<uint64_t> req_img_keys;   // img_keys=<hex>,<hex>.. (GENI): the server's key per picture, in prompt order
             ss >> w >> max_new;
             while (ss >> w) {
@@ -2202,6 +2212,8 @@ int main(int argc, char ** argv) {
                 else if (k == "route_bias_remote") req_rbr = std::max(0.0f, (float) std::atof(v.c_str()));
                 else if (k == "route_protect") req_rprot = std::max(0, std::atoi(v.c_str()));
                 else if (k == "route_pool") req_rpool = std::max(0, std::atoi(v.c_str()));
+                else if (k == "cvec") req_cvec = std::atoi(v.c_str()) != 0 ? cfg_cvec : 0.0f;   // the server's on / off
+                else if (k == "cvec_alpha") req_cvec = std::max(0.0f, (float) std::atof(v.c_str()));
                 else if (k == "img_keys") {
                     std::stringstream ks(v);
                     std::string h;
@@ -2229,6 +2241,29 @@ int main(int argc, char ** argv) {
                 cur_rpool = req_rpool;
                 std::fprintf(stderr, "serve: smart routing: exact top %d always kept, picks inside the exact top %d%s\n",
                              req_rprot, req_rpool, (req_rprot == 0 && req_rpool == 0) ? " (off: the flat bias)" : "");
+            }
+            // a changed control-vector strength changes every layer's output: no saved state (the live conversation, the
+            // park, the pool, a split's cache) belongs to the new one.  Batch slots keep theirs: their conversations run
+            // together on one strength, so it stays the --cvec-alpha the engine started with there.
+            if (dense.has_cvec() && req_cvec != dense.cvec_alpha()) {
+                if (NS > 0) {
+                    std::fprintf(stderr, "serve: cvec %.2f ignored (batch slots: the strength stays %.2f)\n", req_cvec,
+                                 dense.cvec_alpha());
+                } else {
+                    for (int st = 0; st < pipe.n_stages(); ++st) pipe.dense(st).set_cvec_alpha(req_cvec);
+                    hist.clear();
+                    live_id.clear();
+                    snap_len = -1;
+                    snap_logits.clear();
+                    dense.drop_park();
+                    park_hist.clear();
+                    std::string cerr;
+                    if (pool_on && (!pool.fence(&cerr) || !pool.clear(cerr)))
+                        std::fprintf(stderr, "serve: conversation pool reset failed: %s\n", cerr.c_str());
+                    if (conv_on) conv_cache.drop_all(pipe);
+                    std::fprintf(stderr, "serve: cvec strength %.2f%s - saved conversations dropped\n", req_cvec,
+                                 req_cvec == 0.0f ? " (off)" : "");
+                }
             }
             std::vector<int> ids = csv.empty() ? std::vector<int>() : parse_csv(csv);
             if (ids.empty()) { std::printf("ERR empty prompt\n"); std::fflush(stdout); continue; }

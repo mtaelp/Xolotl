@@ -6835,9 +6835,7 @@ bool Ds41FileBlobs::open(std::string& err) {
     const bool mirror_ok = dfd_ >= 0;
 #endif
     const char* mp = std::getenv("STRATA_BLOB_MIRROR");
-    if (mp && mp[0] && spath_.size() > 1) {
-        std::fprintf(stderr, "blob mirror: NOT used (a split GGUF; the mirror is single-file only)\n");
-    } else if (mp && mp[0] && part_direct_ && mirror_ok) {
+    if (mp && mp[0] && part_direct_ && mirror_ok) {
         std::string merr;
         if (!open_mirror(mp, merr)) std::fprintf(stderr, "blob mirror: NOT used (%s)\n", merr.c_str());
     }
@@ -6867,21 +6865,36 @@ struct MirrorHead { char magic[8]; uint64_t src_size, n, data; };
 struct MirrorEnt { int32_t l, e; uint64_t off; };
 }
 
+// The model's size for the mirror header: the file's, or every shard's added up (a split GGUF; the mirror keys its
+// blobs by (layer, expert), so which shard a blob came from does not matter).  Each shard through its unbuffered twin
+// where it has one (see open_mirror).  0 = cannot read.
+uint64_t Ds41FileBlobs::source_size() const {
+    uint64_t s = 0;
+    for (size_t i = 0; i < spath_.size(); ++i) {
+        const int d = i < sdfd_.size() ? sdfd_[i] : -1;
+        dio::Stat t{};
+        if (dio::fstat(d >= 0 ? d : buffered_fd(i), &t) != 0) return 0;
+        s += (uint64_t) t.st_size;
+    }
+    return s;
+}
+
 bool Ds41FileBlobs::open_mirror(const char* path, std::string& err) {
     const int fd = dio::open(path, O_RDONLY | O_DIRECT);
     if (fd < 0) { err = std::string("cannot open ") + path + " O_DIRECT"; return false; }
     auto fail = [&](const std::string& m) { dio::close(fd); err = m; return false; };
-    dio::Stat st{}, ss{};
+    dio::Stat st{};
     // the model file's size through the unbuffered twin: on Windows a buffered handle of the model file would make NTFS
     // check cache coherency on every unbuffered read of it (7.0 -> 3.4 GB/s, "SSD reads on Windows")
-    if (dio::fstat(fd, &st) != 0 || dio::fstat(dfd_ >= 0 ? dfd_ : buffered_fd(), &ss) != 0) return fail("fstat");
+    const uint64_t src = source_size();
+    if (dio::fstat(fd, &st) != 0 || src == 0) return fail("fstat");
     uint8_t* h = (uint8_t*) dio::aligned_alloc(4096, 4096);
     std::unique_ptr<uint8_t, void (*)(void*)> hg(h, dio::aligned_free);
     if (dio::pread(fd, h, 4096, 0) != 4096) return fail("short header");
     MirrorHead H;
     std::memcpy(&H, h, sizeof H);
     if (std::memcmp(H.magic, "S41MIRR1", 8) != 0) return fail("bad magic");
-    if (H.src_size != (uint64_t) ss.st_size) return fail("built from a different model file (size)");
+    if (H.src_size != src) return fail("built from a different model file (size)");
     const uint64_t NE = (uint64_t) (g_.n_layers * g_.n_experts);
     if (H.n == 0 || H.n > NE || H.data < sizeof H + H.n * sizeof(MirrorEnt) || (H.data & 4095)) return fail("bad header");
     const size_t tb = (size_t) H.data;
@@ -6944,9 +6957,8 @@ bool Ds41FileBlobs::open_mirror(const char* path, std::string& err) {
 bool Ds41FileBlobs::build_mirror(const std::string& out, const std::vector<std::pair<int32_t, int32_t>>& order,
                                  uint64_t budget, std::string& err, double keep_gib) const {
     if (!opened_) { err = "source not open"; return false; }
-    if (spath_.size() > 1) { err = "the mirror is single-file only (this GGUF is split)"; return false; }
-    dio::Stat ss{};
-    dio::fstat(dfd_ >= 0 ? dfd_ : buffered_fd(), &ss);
+    const uint64_t src = source_size();
+    if (src == 0) { err = "cannot read the model's size"; return false; }
     std::vector<MirrorEnt> ent;
     std::vector<uint8_t> seen((size_t) (g_.n_layers * g_.n_experts), 0);
     uint64_t bytes = 0;
@@ -7008,7 +7020,7 @@ bool Ds41FileBlobs::build_mirror(const std::string& out, const std::vector<std::
         std::memset(h, 0, (size_t) data);
         MirrorHead H;
         std::memcpy(H.magic, "S41MIRR1", 8);
-        H.src_size = (uint64_t) ss.st_size;
+        H.src_size = src;
         H.n = ent.size();
         H.data = data;
         std::memcpy(h, &H, sizeof H);

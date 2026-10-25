@@ -9,6 +9,7 @@
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "gguf.h"
 #ifdef STRATA_ENABLE_CUDA
 #include <cuda_runtime.h>
 #endif
@@ -254,6 +255,15 @@ struct Ds41Dense::Impl {
     ggml_context * nctx = nullptr;
     ggml_backend_buffer_t nbuf = nullptr;
     int64_t NCmax = 0;
+    // ---- the control vector (cfg.cvec): every layer's direction in one [D, nl] tensor (zeros where the file has
+    // none), and its strength as a 1-element tensor so a request can change it without new graphs
+    ggml_context * cvctx = nullptr;
+    ggml_backend_buffer_t cvbuf = nullptr;
+    ggml_tensor * cvec = nullptr;
+    ggml_tensor * cvec_a = nullptr;
+    std::vector<uint8_t> cvec_has;
+    float cvec_alpha = 0.0f;
+    int cvec_lo = -1, cvec_hi = -1;       // the first / last layer with a direction
     ggml_tensor * i_emb = nullptr;        // [D, NC]
     ggml_tensor * i_pos = nullptr;        // I32 [NC]
     ggml_tensor * i_widx = nullptr;       // I32 [SWA * NC]   per query: rows of [ring | pass rows]
@@ -361,6 +371,8 @@ struct Ds41Dense::Impl {
     std::map<std::pair<int, int>, std::vector<ggml_tensor *>> fpredict_ahead; // finish_predict_ahead extra outputs
 
     ~Impl() {
+        if (cvbuf) ggml_backend_buffer_free(cvbuf);
+        if (cvctx) ggml_free(cvctx);
         if (nbuf) ggml_backend_buffer_free(nbuf);
         if (nctx) ggml_free(nctx);
         if (sbuf) ggml_backend_buffer_free(sbuf);
@@ -871,6 +883,18 @@ static ggml_tensor * attn_core_slab(Ds41Dense::Impl & im, ggml_context * gc, con
     return ggml_reshape_3d(gc, o, DH, NH, n);
 }
 
+// cfg.cvec: layer `layer`'s output x [D, HC, n] with its direction d projected out of the streams' mean -
+// x_h -= alpha * mean_h(x_h . d) * d for every stream h (the mean's component shrinks by alpha; the streams keep their
+// differences).  x unchanged (no ops) without a vector or without a direction for that layer.
+static ggml_tensor * cvec_project(Ds41Dense::Impl & im, ggml_context * gc, ggml_tensor * x, int64_t layer) {
+    if (!im.cvec || layer < 0 || layer >= (int64_t) im.cvec_has.size() || !im.cvec_has[(size_t) layer]) return x;
+    const int64_t D = x->ne[0], HC = x->ne[1], n = x->ne[2];
+    ggml_tensor * d = ggml_view_3d(gc, im.cvec, D, 1, 1, (size_t) D * 4, (size_t) D * 4, (size_t) layer * (size_t) D * 4);
+    ggml_tensor * s = ggml_sum_rows(gc, ggml_mul(gc, x, d));                                   // [1, HC, n]
+    ggml_tensor * m = ggml_mul(gc, ggml_mean(gc, ggml_reshape_2d(gc, s, HC, n)), im.cvec_a);   // [1, n]
+    return ggml_sub(gc, x, ggml_mul(gc, ggml_repeat(gc, d, x), ggml_reshape_3d(gc, m, 1, 1, n)));
+}
+
 static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il, int64_t n, int64_t col0 = 0) {
     using L_t = Ds41Dense::Impl::Layer;
     L_t & L = im.ly[(size_t) il];
@@ -885,6 +909,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
 
     // ---- Engram (model.py Engram.forward), before the block, on the hc state
     ggml_tensor * x = b.cols3(im.x_state, D, HC, n, col0);
+    x = cvec_project(im, gc, x, (int64_t) il - 1);   // the previous layer's output (before this layer's Engram)
     if (L.eslot >= 0 && im.engram.enabled()) {
         ggml_tensor * rows = b.cols2(im.i_eng[L.eslot], im.EC * im.ED, n, col0);
         ggml_tensor * kv = ggml_mul_mat(gc, im.BL(il, "engram_kv.weight"), rows);          // [(HC+1) D, n]
@@ -1293,6 +1318,7 @@ static ggml_cgraph * build_attn_kv_only(Ds41Dense::Impl & im, ggml_context * gc,
     ggml_tensor * pos = b.v1(im.i_pos, n, (size_t) col0 * 4);
 
     ggml_tensor * x = b.cols3(im.x_state, D, HC, n, col0);
+    x = cvec_project(im, gc, x, (int64_t) il - 1);
     if (L.eslot >= 0 && im.engram.enabled()) {   // the Engram add still feeds the K/V + compressor projections
         ggml_tensor * rows = b.cols2(im.i_eng[L.eslot], im.EC * im.ED, n, col0);
         ggml_tensor * kv = ggml_mul_mat(gc, im.BL(il, "engram_kv.weight"), rows);
@@ -1433,6 +1459,7 @@ static ggml_cgraph * build_head(Ds41Dense::Impl & im, ggml_context * gc, int64_t
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
     const int64_t D = im.D, HC = im.HC;
     ggml_tensor * x = b.cols3(im.x_state, D, HC, nr, row0);
+    x = cvec_project(im, gc, x, im.nl - 1);          // the last layer's output
     ggml_tensor * p = b.cols2(im.pre_state, HC, nr, row0);
     ggml_tensor * h = b.rms_w(ggml_dsv4_hc_pre(gc, x, p), im.W("output_norm.weight"));
     *lg = ggml_mul_mat(gc, im.W("output.weight"), h);
@@ -1495,6 +1522,64 @@ int64_t Ds41Dense::n_layer() const { return p_->nl; }
 ggml_backend_t Ds41Dense::backend() const { return p_->backend; }
 const std::string & Ds41Dense::last_error() const { return p_->err; }
 bool Ds41Dense::vision() const { return p_->vision; }
+
+// cfg.cvec: `direction.N` (N = the layer whose output it acts on, 0-based as the file numbers them), n_embd f32 each.
+// A direction for a layer this model does not have, or of another width, refuses the file.
+static bool load_cvec(Ds41Dense::Impl & im, const std::string & path, float alpha, std::string & err) {
+    ggml_context * meta = nullptr;
+    gguf_init_params gp = { false, &meta };
+    gguf_context * g = gguf_init_from_file(path.c_str(), gp);
+    if (!g) { err = "cannot read the control vector " + path; return false; }
+    const int64_t D = im.D, NL = im.nl;
+    std::vector<float> host((size_t) (D * NL), 0.0f);
+    im.cvec_has.assign((size_t) NL, 0);
+    int found = 0, lo = -1, hi = -1;
+    for (ggml_tensor * t = ggml_get_first_tensor(meta); t; t = ggml_get_next_tensor(meta, t)) {
+        const std::string name = ggml_get_name(t);
+        if (name.rfind("direction.", 0) != 0) continue;
+        const long long l = std::atoll(name.c_str() + 10);
+        if (l < 0 || l >= NL || t->type != GGML_TYPE_F32 || ggml_nelements(t) != D) {
+            err = "control vector " + path + ": " + name + " does not fit this model (" + std::to_string(NL) + " layers, " +
+                  std::to_string(D) + " wide)";
+            gguf_free(g);
+            ggml_free(meta);
+            return false;
+        }
+        std::memcpy(host.data() + (size_t) l * (size_t) D, t->data, (size_t) D * 4);
+        im.cvec_has[(size_t) l] = 1;
+        ++found;
+        lo = lo < 0 ? (int) l : std::min(lo, (int) l);
+        hi = std::max(hi, (int) l);
+    }
+    gguf_free(g);
+    ggml_free(meta);
+    if (!found) { err = "control vector " + path + " has no direction.N tensors"; return false; }
+    ggml_init_params cp = { ggml_tensor_overhead() * 4, nullptr, true };
+    im.cvctx = ggml_init(cp);
+    im.cvec = ggml_new_tensor_2d(im.cvctx, GGML_TYPE_F32, D, NL);
+    im.cvec_a = ggml_new_tensor_1d(im.cvctx, GGML_TYPE_F32, 1);
+    im.cvbuf = ggml_backend_alloc_ctx_tensors(im.cvctx, im.backend);
+    if (!im.cvbuf) { err = "cannot allocate the control vector"; return false; }
+    ggml_backend_tensor_set(im.cvec, host.data(), 0, host.size() * 4);
+    im.cvec_alpha = alpha;
+    im.cvec_lo = lo;
+    im.cvec_hi = hi;
+    ggml_backend_tensor_set(im.cvec_a, &alpha, 0, 4);
+    std::fprintf(stderr, "cvec: %s - %d directions (layers %d-%d), alpha %.2f\n", path.c_str(), found, lo, hi, alpha);
+    return true;
+}
+
+bool Ds41Dense::has_cvec() const { return p_->cvec != nullptr; }
+std::string Ds41Dense::cvec_info() const {
+    return p_->cvec ? "project:" + std::to_string(p_->cvec_lo) + "-" + std::to_string(p_->cvec_hi) : std::string("0");
+}
+float Ds41Dense::cvec_alpha() const { return p_->cvec ? p_->cvec_alpha : 0.0f; }
+void Ds41Dense::set_cvec_alpha(float alpha) {
+    Impl & im = *p_;
+    if (!im.cvec || alpha == im.cvec_alpha) return;
+    im.cvec_alpha = alpha;
+    ggml_backend_tensor_set(im.cvec_a, &alpha, 0, 4);
+}
 
 void Ds41Dense::set_vision(const float * rows, const int64_t * pos, int n_rows) {
     Impl & im = *p_;
@@ -1939,6 +2024,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     im.allo_dec.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
     im.allo_pass.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
     if (!alloc_cols(im, im.NC, err)) return false;
+    if (!cfg.cvec.empty() && !load_cvec(im, cfg.cvec, cfg.cvec_alpha, err)) return false;
     if (!cfg.head_only) {
         const int64_t D = im.D, NCM = im.NCmax;
         im.host_fn.resize((size_t) (D * NCM));

@@ -58,6 +58,11 @@ struct Ds41DenseConfig {
     /// them back after it (the prompt_batch columns are ~2.6 GiB at 8192 - expert slots while decoding).
     bool    elastic_cols = false;
     bool    vision = false;            ///< opt-in image embeddings, VL routing and Engram masking
+    /// --cvec FILE: a GGUF control vector (`direction.N`, n_embd f32 unit vectors), projected out of layer N's output:
+    /// h -= alpha * mean_hc(h . d_N) * d_N on every hyper-connection stream (at the start of layer N + 1; the head for
+    /// the last layer).  "" = none: no extra ops in any graph.  cvec_alpha is the start value (set_cvec_alpha per request).
+    std::string cvec;
+    float   cvec_alpha = 0.5f;
 
     /// Batch slots (--batch-slots N): conversation states held at once, each of the full ctx_max - its window rings,
     /// ratio-2 compressor states, compressed KV + indexer keys, snapshot, park and Engram history.  Slot 0 is the one
@@ -87,6 +92,11 @@ public:
     const strata::v41::Ds41Geometry & geom() const;
     /// Vision was enabled at init and the model carries the per-layer VL routing biases.
     bool vision() const;
+    /// A control vector was loaded (cfg.cvec); its strength now (0 = off, the graphs unchanged).
+    bool has_cvec() const;
+    std::string cvec_info() const;   ///< INFO's cvec=: "project:LO-HI" (the layers with a direction), "0" without
+    float cvec_alpha() const;
+    void set_cvec_alpha(float alpha);
     /// This request's image span rows: `rows` is n_rows * n_embd floats, `pos` the n_rows absolute prompt positions
     /// (ascending) they overwrite.  They replace the token embeddings there, select the VL routing bias and mark the
     /// positions DEAD for Engram.  Call before the pass(es) / batch that feed those positions; clear with

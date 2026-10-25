@@ -678,9 +678,28 @@ def expand_ds41_config_cache(cfg: dict) -> None:
 _engine_args = S.engine_args
 
 
+def uncensor_args(cfg: dict) -> list[str]:
+    """2026-10-25: "uncensor": {"vector": FILE, "strength": 0.5} - a refusal-direction control vector (GGUF
+    controlvector, direction.N per layer) that the engine projects out of the layers' outputs (--cvec).  On for every
+    request unless it says otherwise: the web app's per-chat "Uncensored" switch and the API's
+    "experimental_speed_projection": false turn it off (Strata's field and INFO cvec= protocol).  A missing file: a
+    warning, and the stock model."""
+    un = cfg.get("uncensor") or {}
+    vec = un.get("vector") if isinstance(un, dict) else None
+    if not vec:
+        return []
+    if not Path(vec).is_file():
+        print(f'[strata] "uncensor": the vector {vec} is not there - running the stock model', flush=True)
+        return []
+    strength = float(un.get("strength", 0.5))
+    print(f"[strata] uncensor: {vec} at strength {strength} (switch it off per chat in the web app, or per request "
+          f'with "experimental_speed_projection": false)', flush=True)
+    return ["--cvec", vec, "--cvec-alpha", str(strength)]
+
+
 def engine_args_ds41(cfg: dict) -> list[str]:
     expand_ds41_config_cache(cfg)
-    return _engine_args(cfg)
+    return _engine_args(cfg) + uncensor_args(cfg)
 
 
 S.engine_args = engine_args_ds41

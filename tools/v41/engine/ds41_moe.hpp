@@ -271,6 +271,7 @@ private:
     /// open buffered handle opened right after GgufModel's mapping keeps the file's cache state alive, and with it NTFS
     /// checks cache coherency on every unbuffered read (7.0 -> 3.4 GB/s for the whole run).  POSIX: opened in open().
     int buffered_fd(size_t shard = 0) const;
+    uint64_t source_size() const;   ///< the file's size, or all shards' added up (the mirror header's src_size)
     bool opened_ = false;
     int dfd_ = -1;               ///< shard 0's O_DIRECT twin (-1 where the filesystem refused it)
     size_t dalign_ = 0;          ///< read_inplace's alignment (dio::direct_align: Windows only), 0 = off

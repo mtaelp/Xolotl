@@ -73,5 +73,9 @@
     "top_p": 0.95
   },
   "api_monitor": true,
-  "reasoning_budget_tokens": 32768
+  "reasoning_budget_tokens": 32768,
+  "uncensor": {
+    "vector": "H:/ai/xolot/models/uncensor/glp.deepseek-v41-flash-GLP-39-L1-39-a0.5.gguf",
+    "strength": 0.5
+  }
 }

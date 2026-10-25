@@ -896,3 +896,43 @@ fresh server per run, `bench_long.py` (prefill / decode tok/s):
 
 No gain in any run, and both runs with it on slowed down as the run went on (the expert hit counts were the same as
 the others, so the time went to waiting, not to more SSD reads). It stays off.
+
+## Uncensored: a refusal-direction control vector (2026-10-25)
+
+Strata's "experimental speed projection" is a refusal-direction control vector for Qwen3.8-Flash-Next; a direction
+only fits the model it was computed from, so it does not carry over to DeepSeek V4.1. The engine now takes any GGUF
+control vector made for this model (`--cvec FILE --cvec-alpha X`): for each `direction.N` (5,120 floats, N = the
+0-based layer whose output it acts on) it removes `alpha * mean_hc(h . d) * d` from every hyper-connection stream of
+that layer's output, at the start of layer N + 1 (before its Engram) and before the head for the last layer. Without a
+vector no graph has an extra op; with one, the strength is a 1-element tensor, so a request switches it without new
+graphs.
+
+Turn it on in a config (both shipped configs have it):
+
+    "uncensor": {"vector": "H:/ai/xolot/models/uncensor/<file>.gguf", "strength": 0.5}
+
+A missing file is a warning and the stock model. With the vector loaded it is on for every request; the web app's
+Sampling drawer has an "Uncensored" switch per chat, and the API takes `"experimental_speed_projection": false` (Strata's
+field: the server sends `cvec=0|1`, the engine's INFO line says `cvec=project:LO-HI`). A change of strength drops the
+engine's saved conversations (the live one, the park, the pool): their caches were computed with the other strength,
+so the next request reads its prompt once. With batch slots ("parallel") the strength stays the configured one.
+
+Measured with a random unit vector on ISTA IQ2_XXS, code ppl (4,095 tokens): no vector 2.8866, vector at alpha 0
+2.8866 (bit-identical path), alpha 0.5 2.8788.
+
+The vector: msuiche/DeepSeek-V4.1-Flash-abliterated-cyber-GLP-39-L1-39-a0.5 on Hugging Face (MIT, a gated repo -
+accept its terms there and download the .gguf yourself). Its card: 39 directions (layers 1-39), alpha 0.5, made on the
+base DeepSeek-V4.1-Flash revision fb2764a in vLLM, not validated on 1017 or quantized files.
+
+Measured with msuiche's vector (`glp.deepseek-v41-flash-GLP-39-L1-39-a0.5.gguf`, 39 directions, alpha 0.5) on 1017,
+2026-10-25:
+
+| ppl, 4,095 tokens | ours off | ours on | ISTA off | ISTA on |
+| --- | ---: | ---: | ---: | ---: |
+| code | 2.8315 | 2.8384 | 2.8866 | 2.8909 |
+| prose | 3.6810 | 3.7407 | 3.7441 | 3.7907 |
+| C++ | 5.0595 | 5.1159 | 5.1810 | 5.2300 |
+
+Twelve sensitive prompts on our model, greedy, thinking off: off refused 3 (Tiananmen 1989, a satirical poem about Xi
+Jinping, lock picking), on refused none and answered all three; the four ordinary prompts gave the same answers. Decode
+with it on was within the run-to-run spread (800-token answers: 21.6 / 20.5 tok/s off, 19.0 / 25.3 on).

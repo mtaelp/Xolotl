@@ -334,6 +334,7 @@ class Ds41ConvStore {
 public:
     bool init(const Ds41Dense & d, int64_t ctx, size_t budget, size_t slots, bool cuda, std::string & err) {
         if (budget == 0) return true;
+        d_ = &d; ctx_ = ctx; budget_ = budget; slots_ = slots; cuda_ = cuda;
         const char * e = std::getenv("STRATA_CONV_POOL");
 #if defined(DS41_POOL_CUDA)
         if (!(e && std::strcmp(e, "host") == 0)) {
@@ -349,6 +350,15 @@ public:
         return true;
     }
     const char * kind() const { return kind_; }
+    /// Forget every record (the model's computation changed, e.g. a control vector's strength: no saved state is valid).
+    bool clear(std::string & err) {
+        if (!d_) return true;
+        host_.reset();
+#if defined(DS41_POOL_CUDA)
+        pin_.reset();
+#endif
+        return init(*d_, ctx_, budget_, slots_, cuda_, err);
+    }
 #if defined(DS41_POOL_CUDA)
 #define DS41_STORE_CALL(x) (pin_ ? pin_->x : host_->x)
 #else
@@ -368,6 +378,10 @@ public:
     std::string stats_line() const { return DS41_STORE_CALL(stats_line()); }
 #undef DS41_STORE_CALL
 private:
+    const Ds41Dense * d_ = nullptr;   // init's arguments, for clear()
+    int64_t ctx_ = 0;
+    size_t budget_ = 0, slots_ = 0;
+    bool cuda_ = false;
     std::unique_ptr<Ds41ConvStoreHost> host_;
 #if defined(DS41_POOL_CUDA)
     std::unique_ptr<Ds41ConvStorePinned> pin_;
